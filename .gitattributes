@@ -14,6 +14,7 @@ update-binary  text eol=lf
 updater-script text eol=lf
 
 # 二进制文件不做换行转换
+# 注意：android 上 bash 读取 CRLF 的 service.sh 会解析失败，这是本文件存在的唯一原因
 *.zip  binary
 *.png  binary
 *.jpg  binary
