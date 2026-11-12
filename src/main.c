@@ -16,6 +16,7 @@
 #include "printf_with_time.h"
 #include "value_set.h"
 #include "foreground_app.h"
+#include "charge_log.h"
 
 //重新向内核节点施加各项“解锁”参数的周期（单位:s）
 //系统（温控服务、充电HAL、PD重新协商）会在运行过程中把某些节点改回默认值，
@@ -448,17 +449,69 @@ static int apply_kernel_values()
     return written;
 }
 
+/*
+按电量计算本轮允许写入的电流上限
+SMART_CHARGE=0时直接返回CURRENT_MAX，保持旧版“能多快就多快”的行为
+SMART_CHARGE=1时以PEAK_CURRENT为满速基准，电量越高允许的电流越小：
+  低于STAGE_START          100%
+  STAGE_START~90%           70%
+  90%~95%                   45%
+  95%以上                   25%
+分段的意义不是把峰值做大（峰值由充电IC和电池电压决定，sysfs改不了），
+而是让系统自身的阶梯充电不再提前掐掉电流，把降速点挪到高电量段
+*/
+static int stage_current_limit(int capacity, int current_max, char *stage, int stage_size)
+{
+    int stage_start=0,peak=0,percent=100;
+    if(read_one_option("SMART_CHARGE") != 1)
+    {
+        snprintf(stage, stage_size, "OFF");
+        return current_max;
+    }
+    peak=read_one_option("PEAK_CURRENT");
+    //基准电流配得比下限还小时，退回CURRENT_MAX，避免把充电电流限制到停止充电
+    if(peak < CURRENT_MIN_LIMIT) peak=current_max;
+    //基准电流不能超过用户配置的CURRENT_MAX，否则用户把CURRENT_MAX调小会被本功能架空
+    if(peak > current_max) peak=current_max;
+    stage_start=read_one_option("STAGE_START");
+    if(stage_start < 50) stage_start=50;
+    if(stage_start > 99) stage_start=99;
+    if(capacity < stage_start)
+    {
+        percent=100;
+        snprintf(stage, stage_size, "0-%d", stage_start);
+    }
+    else if(capacity < 90)
+    {
+        percent=70;
+        snprintf(stage, stage_size, "%d-90", stage_start);
+    }
+    else if(capacity < 95)
+    {
+        percent=45;
+        snprintf(stage, stage_size, "90-95");
+    }
+    else
+    {
+        percent=25;
+        snprintf(stage, stage_size, "95-100");
+    }
+    return (int)((long long)peak*percent/100);
+}
+
 int main()
 {
     char *temp_sensor = NULL,**current_limit_file = NULL,**current_max_file = NULL,**temp_file = NULL;
-    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
+    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},applied_char[20]={0},stage_name[20]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
     uchar step_charge=1,power_control=1,force_temp=1,has_force_temp=0,current_change=1,battery_status=1,battery_capacity=1;
     int temp_int=0,current_limit_file_num=0,last_charge_stop=-1,charge_is_stop=0,is_first_time=1,temp_sensor_num=0;
     int current_max_file_num=0,temp_file_num=0,is_bypass=0,can_get_foreground=0,screen_is_off=0,last_temp_max=-1,last_charge_status=0,read_option_time=5;
+    int applied_current=0,full_handled=0;
     time_t last_reapply_time=0;
     pthread_t thread1 = {0},thread2 = {0};
     //初始化链表
     insert_all_option();
+    charge_log_init();
     printf("作者：酷安@诺鸡鸭\n");
     printf("GitHub开源地址：https://github.com/chase535/turbo-charge\n\n");
     //如果是写入文件，则必须加上这句话，不然只能等缓冲区满了后才会一次性写入
@@ -482,6 +535,11 @@ int main()
     pthread_create(&thread2, NULL, &read_option_file, (void *)&read_option_time);
     pthread_detach(thread2);
     load_current_config(current_max_char, 20, highest_temp_current_char, 20);
+    //老用户的option.txt里没有新配置项，升级后SMART_CHARGE会用默认值1，
+    //但STEP_CHARGING_DISABLED仍然是他们原来的0，此时系统会提前降流，需要明确提示
+    if(read_one_option("SMART_CHARGE") == 1 && read_one_option("STEP_CHARGING_DISABLED") != 1)
+        printf_with_time("提示：智能分段充电已启用，但阶梯式充电仍处于开启状态，系统会在电量过半后自行降流，建议把option.txt中的STEP_CHARGING_DISABLED改为1");
+    printf_with_time("充电采样日志：/data/adb/turbo-charge/charge_log.csv（充电中每5秒一行）");
     printf_with_time("文件检测完毕，程序开始运行");
     //写入初值
     apply_kernel_values();
@@ -564,8 +622,41 @@ int main()
                 last_charge_status=1;
                 is_first_time=0;
             }
+            /*
+            电池充满后不再干预
+            继续往constant_charge_current_max写大电流并伪造成28℃，会让内核一直维持涓流充电，
+            表现出来就是“电量已经100%了，充电器还在输出”
+            */
+            if(!strcmp(charge, "Full") || atoi(power) >= 100)
+            {
+                if(has_force_temp)
+                {
+                    set_temp(temp_sensor, temp_file, temp_file_num, 0);
+                    has_force_temp=0;
+                }
+                if(!full_handled)
+                {
+                    printf_with_time("电池已充满，停止修改充电参数并交还系统控制");
+                    full_handled=1;
+                }
+                if(power_control) powel_ctl(&last_charge_stop, &charge_is_stop);
+                charge_log_sample(atoi(power), charge, 0, "FULL", temp_sensor);
+                sleep(read_one_option("CYCLE_TIME"));
+                continue;
+            }
+            if(full_handled)
+            {
+                printf_with_time("电量已回落到100%%以下，恢复充电参数控制");
+                full_handled=0;
+            }
             //充电时强制显示28度功能
-            if(force_temp && read_one_option("FORCE_TEMP") == 1) set_array_value(temp_file, temp_file_num, "280");
+            //不能无条件写28℃：真实温度超过FORCE_TEMP_MAX时必须把真实值交还给系统，
+            //否则系统自身的JEITA过温保护会一直以为电池只有28℃
+            if(force_temp && read_one_option("FORCE_TEMP") == 1)
+            {
+                set_temp(temp_sensor, temp_file, temp_file_num, 1);
+                has_force_temp=1;
+            }
             else if(has_force_temp) set_temp(temp_sensor, temp_file, temp_file_num, 0);
             //电量控制功能
             if(power_control) powel_ctl(&last_charge_stop, &charge_is_stop);
@@ -648,8 +739,11 @@ int main()
                         else if(step_charge == 2) (read_one_option("STEP_CHARGING_DISABLED") == 1)?step_charge_ctl("0"):step_charge_ctl("1");
                         //向电流文件中写入限制电流数值
                         set_array_value(current_max_file, current_max_file_num, highest_temp_current_char);
+                        charge_log_sample(atoi(power), charge, atoi(highest_temp_current_char), "TEMP-CTRL", temp_sensor);
                         //充电时强制显示28度功能
-                        if(force_temp && read_one_option("FORCE_TEMP") == 1) set_array_value(temp_file, temp_file_num, "280");
+                        //此处已经处于高温限流状态，温度基本都超过FORCE_TEMP_MAX，
+                        //set_temp(tempwall=1)会把真实温度交给系统，不再继续伪装
+                        if(force_temp && read_one_option("FORCE_TEMP") == 1) set_temp(temp_sensor, temp_file, temp_file_num, 1);
                         else if(has_force_temp) set_temp(temp_sensor, temp_file, temp_file_num, 0);
                         //电量控制功能
                         if(power_control) powel_ctl(&last_charge_stop, &charge_is_stop);
@@ -657,8 +751,26 @@ int main()
                     }
                 }
             }
-            //向电流文件中写入最大充电电流
-            if(current_change) set_array_value(current_max_file, current_max_file_num, current_max_char);
+            /*
+            按电量分段限流，并用温度传感器的原始读数做独立熔断
+            FORCE_TEMP把电池温度伪造成28℃之后，系统自己的过温保护等于失效，
+            所以这里必须再拿一遍thermal_zone的真实温度，超过FORCE_TEMP_MAX就直接降到安全电流
+            */
+            applied_current=stage_current_limit(atoi(power), atoi(current_max_char), stage_name, sizeof(stage_name));
+            if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num && temp_sensor != NULL)
+            {
+                int real_temp=0;
+                if(read_temp(temp_sensor, &real_temp) && real_temp >= read_one_option("FORCE_TEMP_MAX")*1000)
+                {
+                    applied_current=atoi(highest_temp_current_char);
+                    snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
+                    if(should_log()) printf_with_time("温度传感器原始读数为%.1f℃，已达安全阈值，电流限制为%dμA", (double)real_temp/1000.0, applied_current);
+                }
+            }
+            snprintf(applied_char, sizeof(applied_char), "%d", applied_current);
+            //向电流文件中写入本轮允许的最大充电电流
+            if(current_change) set_array_value(current_max_file, current_max_file_num, applied_char);
+            charge_log_sample(atoi(power), charge, applied_current, stage_name, temp_sensor);
         }
         //如果手机未在充电，则只会刷新显示温度，以及若执行了获取前台应用包名的子线程，则取消此子线程
         else
@@ -700,11 +812,13 @@ int main()
             if(power_control) powel_ctl(&last_charge_stop, &charge_is_stop);
             //此标识符代表手机是否通过此程序修改了电池温度
             //如果修改了，则电池温度无法再自动刷新，需要通过此程序进行刷新
+            //未充电时没有伪装温度的必要，一律写回真实温度，避免残留的28℃误导用户和系统
             if(has_force_temp)
             {
-                if(read_one_option("FORCE_TEMP") == 1) set_temp(temp_sensor, temp_file, temp_file_num, 1);
-                else set_temp(temp_sensor, temp_file, temp_file_num, 0);
+                set_temp(temp_sensor, temp_file, temp_file_num, 0);
+                has_force_temp=0;
             }
+            charge_log_sample(atoi(power), charge, 0, "IDLE", temp_sensor);
         }
         sleep(read_one_option("CYCLE_TIME"));
     }

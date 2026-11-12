@@ -34,6 +34,20 @@
 
 5.排查“快充不生效”时请先看log.txt：进程是否还在（`ps -A | grep turbo-charge`）、有没有“判定不适配”、有没有限制电流的记录
 
+6.功率上不去、掉得快、充满还在充这类问题，看 `charge_log.csv`：
+```bash
+adb pull /data/adb/turbo-charge/charge_log.csv
+```
+充电中每5秒一行，重点看四列：
+- `tsensor_c` 温度传感器原始读数（模块改不到的那个）。`tbat_c` 是被伪造成 28.0 的那一列，只能当参考
+- `vusb_v` / `ibus_max_a` 充电器实际协商到的电压与电流上限。想看“67W 套件有没有被识别”就看这里，卡在 5V 说明只走了普通协议
+- `ccc_max_a` / `ccc_a` 内核实际接受的恒流上限和实际恒流值。模块写进去又被系统改回去，这里会立刻露出来
+- `applied_a` / `stage` 模块本轮写入的电流与所处档位（`0-80`、`80-90`、`TEMP-GUARD` 等）
+
+7.智能分段充电（`SMART_CHARGE=1`）把降速点挪到高电量段。要它真正生效，**必须同时把 `STEP_CHARGING_DISABLED` 设为 1**，否则系统会在电量过半后先自己降流，模块写多大的电流上限都没用——这是“峰值只维持一小会儿然后一路掉到10W”最常见的原因。老配置文件升级后不会自动改这一项，需要手动改
+
+8.温度有两道保护：`TEMP_MAX`（默认52℃，超过就限流到 `HIGHEST_TEMP_CURRENT`）和 `FORCE_TEMP_MAX`（默认45℃，用温度传感器原始读数判断）。后者是硬熔断：`FORCE_TEMP=1` 把系统看到的温度伪造成 28℃ 之后，系统自己的 JEITA 保护等于失效，所以超过 `FORCE_TEMP_MAX` 时程序会把**真实温度**写回系统并同时限流，不再继续骗
+
 ## CI构建与自动发版
 
 本仓库（fork）已接入完整自动化，全部在 [Actions](https://github.com/dong20210702/turbo-charge/actions) 完成：

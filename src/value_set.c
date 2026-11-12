@@ -78,8 +78,19 @@ void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar temp
     //旧版本用snprintf截断字符串来换算，温度低于10℃或为负数时会被算错（9.5℃→95℃、-5℃→-50℃）
     temp_int=raw_temp/100;
     snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int);
-    //如果tempwall为1，则判断温度是否超过指定值，若超过则强制显示28度，否则显示正常温度
+    //如果tempwall为1，则判断温度是否超过指定值，若超过则显示真实温度（交给系统自己的温控），否则显示28℃
     //如果tempwall为0，则永远显示正常温度
-    if(tempwall) (temp_int >= 450)?set_array_value(temp_file, temp_file_num, "280"):set_array_value(temp_file, temp_file_num, bat_temp);
+    /*
+    阈值以前是写死的45℃，现在改为读取配置FORCE_TEMP_MAX：
+    电池温度被长期伪造成28℃后，系统自身的JEITA保护完全失效，
+    用户在看到"28.0℃"的同时真实温度可能已经四十多度，
+    所以超过阈值时必须把真实温度交还给系统，不能继续骗下去
+    */
+    if(tempwall)
+    {
+        int threshold=read_one_option("FORCE_TEMP_MAX");
+        if(threshold < 35) threshold=35;
+        (temp_int >= threshold)?set_array_value(temp_file, temp_file_num, bat_temp):set_array_value(temp_file, temp_file_num, "280");
+    }
     else set_array_value(temp_file, temp_file_num, bat_temp);
 }
