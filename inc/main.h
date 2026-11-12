@@ -16,7 +16,7 @@ int find_temp_sensor(char **temp_sensor);
 void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar *power_control,
                           uchar *step_charge, uchar *force_temp, uchar *current_change,
                           int *temp_sensor_num, char **temp_sensor,
-                          char ***current_max_file, int *current_max_file_num,
+                          char ***current_max_file, int *current_max_file_num, int **current_max_unit,
                           char ***current_limit_file, int *current_limit_file_num,
                           char ***temp_file, int *temp_file_num);
 

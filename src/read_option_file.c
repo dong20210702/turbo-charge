@@ -165,14 +165,24 @@ void *read_option_file(void *arg)
                 {
                     //将配置名与等号进行拼接，用来进行匹配
                     snprintf(option_tmp, 42, "%s=", node->name);
-                    if(strstr(option, option_tmp) == NULL) continue;
+                    /*
+                    必须从行首开始匹配
+                    旧代码用strstr做子串匹配，只要某个配置名出现在另一行的中间就会被误判：
+                    FORCE_TEMP_MAX=45 这一行含有子串"TEMP_MAX="，于是被当成是在设置TEMP_MAX，
+                    又因为取值固定写成 option+strlen("TEMP_MAX=")，实际取到的是"P_MAX=45"，
+                    结果每次都报“TEMP_MAX的值不是由纯数字组成”，TEMP_MAX的配置值永远不生效
+                    这里额外跳过行首空白，兼容手动编辑时缩进过的情况
+                    */
+                    char *key=option;
+                    while(*key == ' ' || *key == '\t') key++;
+                    if(strncmp(key, option_tmp, strlen(option_tmp)) != 0) continue;
                     //value_stat数组存储配置文件中每个变量值的状态，详情直接看后面判断value_stat数组的值的相关代码
                     value_stat[opt]=10;
                     //判断变量值是否合法，合法则对程序内部变量进行赋值，否则将状态存入value_stat数组中
-                    if(!strcmp(option, option_tmp)) value_stat[opt]=1;
+                    if(!strcmp(key, option_tmp)) value_stat[opt]=1;
                     else
                     {
-                        value=option+strlen(option_tmp);
+                        value=key+strlen(option_tmp);
                         for(i=0;i < (int)strlen(value);i++)
                         {
                             if((value[i] < '0' || value[i] > '9') && ((!i && (value[i] != '-' || strlen(value) == 1)) || i))

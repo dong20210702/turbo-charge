@@ -17,6 +17,7 @@
 #include "value_set.h"
 #include "foreground_app.h"
 #include "charge_log.h"
+#include "probe.h"
 
 //重新向内核节点施加各项“解锁”参数的周期（单位:s）
 //系统（温控服务、充电HAL、PD重新协商）会在运行过程中把某些节点改回默认值，
@@ -285,6 +286,20 @@ static void add_path(char ***file, int *num, int *cap, char *path, int path_len)
 }
 
 /*
+判断路径是否以指定后缀结尾
+原代码用 path+path_len-固定数字 的方式做后缀比较，长度全靠手数，而
+/constant_charge_current_max 是28字符却写成27、/fast_charge_current 是20字符却写成19，
+差一个字符导致 strcmp 首字符是 'c' 对 '/'，这两个最常用的电流节点从来没被识别成功过
+（只有 thermal_input_current 的长度是对的），所以大量机型表现为“有关电流的所有功能失效”
+*/
+static int has_suffix(const char *path, const char *suffix)
+{
+    size_t path_len=strlen(path), suffix_len=strlen(suffix);
+    if(path_len < suffix_len) return 0;
+    return !strcmp(path+path_len-suffix_len, suffix);
+}
+
+/*
 判断各个所需文件是否存在
 检查电池状态、电量、充电控制、阶梯充电、温度等相关文件
 并在/sys/class/power_supply中搜索电流文件和温度文件
@@ -293,7 +308,7 @@ static void add_path(char ***file, int *num, int *cap, char *path, int path_len)
 void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar *power_control,
                           uchar *step_charge, uchar *force_temp, uchar *current_change,
                           int *temp_sensor_num, char **temp_sensor,
-                          char ***current_max_file, int *current_max_file_num,
+                          char ***current_max_file, int *current_max_file_num, int **current_max_unit,
                           char ***current_limit_file, int *current_limit_file_num,
                           char ***temp_file, int *temp_file_num)
 {
@@ -343,17 +358,36 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
         {
             //如果匹配到了文件，则分配一个与路径字符串大小相等的内存，装入路径，并且记录相应文件数量的变量值+1
             path_len=strlen(power_supply_dir_list[j]);
-            if((path_len >= 27 && !strcmp(power_supply_dir_list[j]+path_len-27, "/constant_charge_current_max"))
-                || (path_len >= 19 && !strcmp(power_supply_dir_list[j]+path_len-19, "/fast_charge_current"))
-                || (path_len >= 22 && !strcmp(power_supply_dir_list[j]+path_len-22, "/thermal_input_current")))
+            /*
+            input_current_limit 也一并纳入：MTK机型的输入限流默认只有3A，
+            如果充电器协商到9V档，3A×9V=27W，正好把功率卡在27W上不去，
+            这才是“峰值30W左右就上不去”的直接原因之一
+            （thermal_input_current_limit 以“_input_current_limit”结尾，前一位是下划线不是斜杠，不会误入本分支）
+            */
+            if(has_suffix(power_supply_dir_list[j], "/constant_charge_current_max")
+                || has_suffix(power_supply_dir_list[j], "/constant_charge_current")
+                || has_suffix(power_supply_dir_list[j], "/fast_charge_current")
+                || has_suffix(power_supply_dir_list[j], "/input_current_limit")
+                || has_suffix(power_supply_dir_list[j], "/thermal_input_current"))
             {
+                /*
+                先探测节点是否真的可用，不可用的直接不收进列表
+                MTK的主从充电架构里，未启用的从充电器节点（mtk-slave-charger、mtk-mst-div-chg等）
+                读出来是-95这类错误码，往这种节点写电流不会有任何效果，
+                如果把它们收进列表，还会让“找到了电流文件”的日志骗人，误以为功能已经生效
+                */
+                if(probe_unit_factor(power_supply_dir_list[j], NULL) <= 0)
+                {
+                    if(should_log()) printf_with_time("忽略不可用的电流文件：%s", power_supply_dir_list[j]);
+                    continue;
+                }
                 add_path(current_max_file, current_max_file_num, &current_max_cap, power_supply_dir_list[j], path_len);
             }
-            else if(path_len >= 28 && !strcmp(power_supply_dir_list[j]+path_len-28, "/thermal_input_current_limit"))
+            else if(has_suffix(power_supply_dir_list[j], "/thermal_input_current_limit"))
             {
                 add_path(current_limit_file, current_limit_file_num, &current_limit_cap, power_supply_dir_list[j], path_len);
             }
-            else if(path_len >= 5 && !strcmp(power_supply_dir_list[j]+path_len-5, "/temp"))
+            else if(has_suffix(power_supply_dir_list[j], "/temp"))
             {
                 add_path(temp_file, temp_file_num, &temp_cap, power_supply_dir_list[j], path_len);
             }
@@ -366,6 +400,17 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
     else { my_free(*current_limit_file); *current_limit_file=NULL; }
     if(*current_max_file_num) *current_max_file=(char **)my_realloc(*current_max_file, sizeof(char *)*(*current_max_file_num));
     else { my_free(*current_max_file); *current_max_file=NULL; }
+    //记录每个电流节点的数值单位（1个数值等于多少μA），MTK的充电IC节点用mA，其余用μA，差1000倍
+    *current_max_unit=NULL;
+    if(*current_max_file_num)
+    {
+        *current_max_unit=(int *)my_calloc(*current_max_file_num, sizeof(int));
+        for(i=0;i < *current_max_file_num;i++)
+        {
+            (*current_max_unit)[i]=probe_unit_factor((*current_max_file)[i], NULL);
+            if((*current_max_unit)[i] <= 0) (*current_max_unit)[i]=1;
+        }
+    }
     if(*temp_file_num) *temp_file=(char **)my_realloc(*temp_file, sizeof(char *)*(*temp_file_num));
     else { my_free(*temp_file); *temp_file=NULL; }
     //判断文件数量是否为0
@@ -404,7 +449,8 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
         printf_with_time("所有的所需文件均不存在，完全不适配此手机，程序强制退出！");
         exit(1000);
     }
-    if(*current_change) for(i=0;i < *current_max_file_num;i++) printf_with_time("找到电流文件：%s", (*current_max_file)[i]);
+    if(*current_change) for(i=0;i < *current_max_file_num;i++)
+        printf_with_time("找到电流文件：%s（单位%s）", (*current_max_file)[i], (*current_max_unit)[i] == 1000?"mA":"μA");
     if(*force_temp) for(i=0;i < *temp_file_num;i++) printf_with_time("找到温度文件：%s", (*temp_file)[i]);
 }
 
@@ -502,9 +548,10 @@ static int stage_current_limit(int capacity, int current_max, char *stage, int s
 int main()
 {
     char *temp_sensor = NULL,**current_limit_file = NULL,**current_max_file = NULL,**temp_file = NULL;
-    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},applied_char[20]={0},stage_name[20]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
+    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},stage_name[20]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
     uchar step_charge=1,power_control=1,force_temp=1,has_force_temp=0,current_change=1,battery_status=1,battery_capacity=1;
     int temp_int=0,current_limit_file_num=0,last_charge_stop=-1,charge_is_stop=0,is_first_time=1,temp_sensor_num=0;
+    int *current_max_unit=NULL;
     int current_max_file_num=0,temp_file_num=0,is_bypass=0,can_get_foreground=0,screen_is_off=0,last_temp_max=-1,last_charge_status=0,read_option_time=5;
     int applied_current=0,full_handled=0;
     time_t last_reapply_time=0;
@@ -526,9 +573,15 @@ int main()
     check_required_files(&battery_status, &battery_capacity, &power_control,
                          &step_charge, &force_temp, &current_change,
                          &temp_sensor_num, &temp_sensor,
-                         &current_max_file, &current_max_file_num,
+                         &current_max_file, &current_max_file_num, &current_max_unit,
                          &current_limit_file, &current_limit_file_num,
                          &temp_file, &temp_file_num);
+    //找不到可写电流节点时生成节点自检报告，用户把该文件发给模块作者即可定位本机真实节点名
+    if(!current_change)
+    {
+        write_probe_report();
+        printf_with_time("电流功能失效，已生成节点自检报告：%s，请将本文件发给模块作者", PROBE_FILE);
+    }
     //如果有电流文件，则获取安卓版本，为以后“伪”旁路供电做准备
     if(current_change) can_get_foreground=check_android_version();
     //创建一个子线程用来读取配置文件
@@ -578,7 +631,7 @@ int main()
             //“伪”旁路供电
             if(current_change && can_get_foreground)
             {
-                bypass_charge_ctl(&thread1, &can_get_foreground, last_appname, &is_bypass, &screen_is_off, current_max_file, current_max_file_num);
+                bypass_charge_ctl(&thread1, &can_get_foreground, last_appname, &is_bypass, &screen_is_off, current_max_file, current_max_file_num, current_max_unit);
                 if(is_bypass && !screen_is_off)
                 {
                     sleep(read_one_option("CYCLE_TIME"));
@@ -586,7 +639,7 @@ int main()
                 }
             }
             //向电流文件写入配置文件中所设置的最大电流
-            if(current_change) set_array_value(current_max_file, current_max_file_num, current_max_char);
+            if(current_change) set_current_array(current_max_file, current_max_unit, current_max_file_num, atoi(current_max_char));
             sleep(read_one_option("CYCLE_TIME"));
             continue;
         }
@@ -663,7 +716,7 @@ int main()
             //如果电流文件存在且安卓版本大于等于7，则执行“伪”旁路供电函数
             if(current_change && can_get_foreground)
             {
-                bypass_charge_ctl(&thread1, &can_get_foreground, last_appname, &is_bypass, &screen_is_off, current_max_file, current_max_file_num);
+                bypass_charge_ctl(&thread1, &can_get_foreground, last_appname, &is_bypass, &screen_is_off, current_max_file, current_max_file_num, current_max_unit);
                 //如果进入了“伪”旁路供电模式，则不执行下面的温度控制相关函数，直接进入下次循环
                 if(is_bypass && !screen_is_off)
                 {
@@ -738,7 +791,7 @@ int main()
                         }
                         else if(step_charge == 2) (read_one_option("STEP_CHARGING_DISABLED") == 1)?step_charge_ctl("0"):step_charge_ctl("1");
                         //向电流文件中写入限制电流数值
-                        set_array_value(current_max_file, current_max_file_num, highest_temp_current_char);
+                        set_current_array(current_max_file, current_max_unit, current_max_file_num, atoi(highest_temp_current_char));
                         charge_log_sample(atoi(power), charge, atoi(highest_temp_current_char), "TEMP-CTRL", temp_sensor);
                         //充电时强制显示28度功能
                         //此处已经处于高温限流状态，温度基本都超过FORCE_TEMP_MAX，
@@ -767,9 +820,9 @@ int main()
                     if(should_log()) printf_with_time("温度传感器原始读数为%.1f℃，已达安全阈值，电流限制为%dμA", (double)real_temp/1000.0, applied_current);
                 }
             }
-            snprintf(applied_char, sizeof(applied_char), "%d", applied_current);
             //向电流文件中写入本轮允许的最大充电电流
-            if(current_change) set_array_value(current_max_file, current_max_file_num, applied_char);
+            if(current_change && !set_current_array(current_max_file, current_max_unit, current_max_file_num, applied_current)
+               && should_log()) printf_with_time("本轮未能写入任何电流节点（共%d个），节点可能已被系统独占，稍后重试", current_max_file_num);
             charge_log_sample(atoi(power), charge, applied_current, stage_name, temp_sensor);
         }
         //如果手机未在充电，则只会刷新显示温度，以及若执行了获取前台应用包名的子线程，则取消此子线程

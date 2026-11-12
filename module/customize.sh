@@ -4,7 +4,16 @@ check_file()
 {
     ui_print " --- 检查所需文件是否存在 ---"
     temp_file=$(ls /sys/class/power_supply/*/temp 2>/dev/null)
-    current_max_file=$(ls /sys/class/power_supply/*/constant_charge_current_max /sys/class/power_supply/*/fast_charge_current /sys/class/power_supply/*/thermal_input_current 2>/dev/null)
+    # 逐个检查电流节点，读出来是负数的直接跳过
+    # MTK 主从充电架构里，未启用的从充电器节点（mtk-slave-charger、mtk-mst-div-chg 等）读出来是 -95 这类错误码，
+    # 路径明明存在但写进去毫无效果，早期版本就是被这些节点骗过去的
+    current_max_file=""
+    for f in /sys/class/power_supply/*/constant_charge_current_max /sys/class/power_supply/*/constant_charge_current /sys/class/power_supply/*/fast_charge_current /sys/class/power_supply/*/input_current_limit /sys/class/power_supply/*/thermal_input_current; do
+        [[ -e "${f}" ]] || continue
+        node_value=$(cat "${f}" 2>/dev/null)
+        case "${node_value}" in -*) continue ;; esac
+        current_max_file="${current_max_file} ${f}"
+    done
     for i in $(ls /sys/class/thermal | grep "thermal_zone"); do
         if [[ -f "/sys/class/thermal/${i}/type" ]]; then
             temp_sensor=$(cat /sys/class/thermal/${i}/type 2>/dev/null)
@@ -37,7 +46,8 @@ check_file()
         ui_print " ！由于找不到部分有关文件，阶梯式充电控制的部分功能失效，详情请看程序运行时的log文件！"
     fi
     if [[ -z "${current_max_file}" ]]; then
-        ui_print " ！由于找不到有关文件，有关电流的所有功能（包括“伪”旁路供电功能）失效，详情请看程序运行时的log文件！"
+        ui_print " ！！！警告：找不到任何可写的充电电流节点，模块将完全不起作用！！！"
+        ui_print " ！！！开机后程序会在 /data/adb/turbo-charge/probe.txt 生成节点清单，请把它发给模块作者"
         no_current_change=1
     fi
     if [[ -z "${temp_file}" || -n "${no_battery_status}" ]]; then

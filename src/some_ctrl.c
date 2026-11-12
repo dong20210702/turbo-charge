@@ -97,7 +97,7 @@ screen_is_off为手机是否处于锁屏状态，与主函数进行通信
 current_max_file为存储电流文件的二级指针变量，与current_max_file_num配套使用
 current_max_file_num为电流文件的个数
 */
-void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appname, int *is_bypass, int *screen_is_off, char **current_max_file, int current_max_file_num)
+void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appname, int *is_bypass, int *screen_is_off, char **current_max_file, int current_max_file_num, int *current_max_unit)
 {
     char name[FOREGROUND_APP_STRING_MAX_SIZE]={0};
     uchar in_list=0;
@@ -175,7 +175,7 @@ void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appn
                 //如果之前在“伪”旁路供电模式而切换应用后还在，就打印相关信息
                 else if(strcmp(last_appname, (char *)ForegroundAppName)) printf_with_time("前台应用切换为%s，位于“伪”旁路供电配置列表中，保持“伪”旁路供电模式", ForegroundAppName);
                 //限制电流，“伪”旁路供电
-                set_array_value(current_max_file, current_max_file_num, BYPASS_CHARGE_CURRENT);
+                set_current_array(current_max_file, current_max_unit, current_max_file_num, atoi(BYPASS_CHARGE_CURRENT));
             }
             else
             {

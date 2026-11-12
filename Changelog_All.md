@@ -1,3 +1,23 @@
+# v72
+
+### Changelog
+
+1.**修复电流节点后缀匹配的长度错误**（这是"装了但完全没效果"的真正原因）：`/constant_charge_current_max` 是28个字符却按27去比较、`/fast_charge_current` 是20个字符却按19去比较，差一个字符导致 `strcmp` 首字符是 `c` 对 `/`，这两个最常用的电流节点**从上游版本开始就从来没被识别成功过**，只有 `thermal_input_current` 的长度是对的。也就是说 v70 及之前只有恰好带该节点的机型才真正生效过
+
+2.**适配 MTK（联发科）机型**：新增 `constant_charge_current`、`input_current_limit` 两类节点。MTK 的节点命名与高通完全不同，此前一台天玑8100机型的日志里明确写着"找不到 constant_charge_current_max、fast_charge_current、thermal_input_current"，模块全程没往任何电流节点写过值，表现就是"装了跟没装一样"
+
+3.**按节点自动换算电流单位**：同一台 MTK 机器上，`battery/constant_charge_current` 读出来是 22000000（μA）而 `i2c:mt6375@34:chg/constant_charge_current` 读出来是 2700（mA），两者语义相同但单位差一千倍，用同一个数字写会把电流放大或缩小一千倍
+
+4.**跳过无效节点**：MTK 主从充电架构里，未启用的从充电器节点（`mtk-slave-charger`、`mtk-mst-div-chg` 等）读出来是 -95 这类错误码，路径存在但写进去毫无效果。现在扫描阶段就剔除，不再让"找到了电流文件"的日志骗人
+
+5.**输入限流一并纳入控制**：MTK 机型默认 `input_current_limit` 只有 3A，若充电器协商到 9V 档，3A×9V=27W，正好把功率卡在 27W 上不去。现在随充电电流一起写入
+
+6.新增节点自检报告：电流节点全部不可用时自动生成 `/data/adb/turbo-charge/probe.txt`，逐个列出 `/sys/class/power_supply` 下每个节点的可写性与当前值
+
+7.修复配置值解析的子串误判：旧代码用 `strstr` 做子串匹配，`FORCE_TEMP_MAX=45` 这一行含有子串 `TEMP_MAX=`，被当成在设置 `TEMP_MAX`，又从固定偏移取到 `P_MAX=45`，于是每次启动都报"配置文件中TEMP_MAX的值不是由纯数字组成"，并且 `TEMP_MAX` 的配置值永远不生效。现已改为行首匹配（兼容行首空白）
+
+8.安装脚本同步按"值是否为负"筛选电流节点，与程序内判定保持一致
+
 # v70
 
 ### Changelog

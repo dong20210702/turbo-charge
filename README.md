@@ -34,6 +34,12 @@
 
 5.排查“快充不生效”时请先看log.txt：进程是否还在（`ps -A | grep turbo-charge`）、有没有“判定不适配”、有没有限制电流的记录
 
+**如果log.txt里出现“有关电流的所有功能失效”**，说明模块在你这台机器上根本没找到可写的电流节点，此时它对充电速度是零贡献，看到的功率曲线全部来自系统原生策略。程序会自动生成节点清单，直接发出来即可：
+```bash
+adb pull /data/adb/turbo-charge/probe.txt
+```
+该文件逐个列出了 `/sys/class/power_supply` 下每个节点的可写标记（`[W]`可写 / `[R]`只读）与当前值。
+
 6.功率上不去、掉得快、充满还在充这类问题，看 `charge_log.csv`：
 ```bash
 adb pull /data/adb/turbo-charge/charge_log.csv

@@ -61,6 +61,67 @@ void set_array_value(char **file, int num, char *value)
 }
 
 /*
+探测电流节点是否可用，并判断它的数值单位
+返回该节点“1个数值”等于多少μA：μA节点返回1，mA节点返回1000
+返回0表示节点不可用（读不到，或当前值是负数）
+
+必须区分单位的原因：同一台MTK机器上，
+/sys/class/power_supply/battery/constant_charge_current 读出来是 22000000（μA，即22A），
+而 /sys/class/power_supply/11280000.i2c:mt6375@34:chg/constant_charge_current 读出来是 2700（mA，即2.7A），
+两者语义相同但单位差1000倍，用同一个数字去写会把电流放大或缩小一千倍
+*/
+int probe_unit_factor(const char *path, int *raw_value)
+{
+    int fd=0, v=0;
+    ssize_t len=0;
+    char buf[48]={0}, *p=buf;
+    if(path == NULL) return 0;
+    fd=open(path, O_RDONLY);
+    if(fd < 0) return 0;
+    len=read(fd, buf, sizeof(buf)-1);
+    close(fd);
+    if(len <= 0) return 0;
+    buf[len]='\0';
+    while(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    v=(int)strtol(p, NULL, 10);
+    if(raw_value != NULL) *raw_value=v;
+    //MTK的充电IC节点（形如 11280000.i2c:mt6375@34:chg）用mA，未启用的从充电器会读到-95这类错误码
+    if(v < 0) return 0;
+    //先按节点名判断，名字不受当前充电阶段影响，比按数值猜更可靠
+    if(strstr(path, "i2c:") != NULL || strstr(path, ":chg/") != NULL) return 1000;
+    //名字判断不出来时再看数值大小：mA节点的值不会超过30000（30A）
+    if(v > 0 && v <= 30000) return 1000;
+    return 1;
+}
+
+/*
+向一组电流节点写入目标电流（单位μA），unit为check_required_files扫描时定下的每个节点的换算系数
+与set_array_value的区别：
+1.按节点单位自动换算，mA节点写入换算后的数值
+2.节点当前值为负数（MTK未启用的从充电器节点返回-95）时直接跳过，写进去也没有任何作用
+3.值本来就一致时不重复写，减少每秒一次的无谓系统调用
+返回真正发生写入的节点个数
+*/
+int set_current_array(char **file, int *unit, int num, int target_ua)
+{
+    int i=0, written=0, factor=1, cur_raw=0;
+    char buf[24]={0};
+    if(file == NULL || num <= 0) return 0;
+    if(target_ua < 0) target_ua=0;
+    for(i=0;i < num;i++)
+    {
+        if(file[i] == NULL) continue;
+        factor=probe_unit_factor(file[i], &cur_raw);
+        if(factor <= 0) continue;
+        if(unit != NULL && unit[i] > 0) factor=unit[i];
+        if(cur_raw*factor == target_ua) continue;
+        snprintf(buf, sizeof(buf), "%d", target_ua/factor);
+        if(set_value(file[i], buf) > 0) written++;
+    }
+    return written;
+}
+
+/*
 向二级指针所指向的温度文件们写入温度
 tempwall为是否启用超过一定温度时强制向温度文件写入28℃
 */
