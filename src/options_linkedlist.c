@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,7 +16,8 @@ void insert_option(char *name, int value)
 {
     ListNode *next,*tmp=&options_head;
     next=(ListNode *)my_calloc(1, sizeof(ListNode));
-    strncpy(next->name, name, OPTION_NAME_MAX_SIZE-1);
+    //用snprintf替代strncpy：源串长度达到上限时strncpy不补'\0'，会被-Werror=stringop-truncation判为错误
+    snprintf(next->name, OPTION_NAME_MAX_SIZE, "%s", name);
     next->value=value;
     next->next=NULL;
     while(tmp->next) tmp=tmp->next;

@@ -146,7 +146,9 @@ void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appn
                         bypass_app_num++;
                         bypass_app_package_name=(char **)my_realloc(bypass_app_package_name, sizeof(char *)*bypass_app_num);
                         bypass_app_package_name[bypass_app_num-1]=(char *)my_calloc(1, sizeof(char)*FOREGROUND_APP_STRING_MAX_SIZE);
-                        strncpy(bypass_app_package_name[bypass_app_num-1], name, APP_PACKAGE_NAME_MAX_SIZE-1);
+                        //strncpy在源串长度达到目标容量时不会补'\0'，GCC的-Werror=stringop-truncation会直接判定为编译错误
+                        //配置文件的单行最长可达FOREGROUND_APP_STRING_MAX_SIZE-1个字符，这里改用snprintf保证一定截断并补'\0'
+                        snprintf(bypass_app_package_name[bypass_app_num-1], FOREGROUND_APP_STRING_MAX_SIZE, "%s", name);
                     }
                     fclose(fp);
                     fp=NULL;

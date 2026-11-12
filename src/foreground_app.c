@@ -65,7 +65,7 @@ void *get_foreground_appname(void *android_version)
         {
             pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
             memset((void *)ForegroundAppName, 0, sizeof(ForegroundAppName));
-            strncpy((char *)ForegroundAppName, "screen_is_off", APP_PACKAGE_NAME_MAX_SIZE);
+            snprintf((char *)ForegroundAppName, FOREGROUND_APP_STRING_MAX_SIZE, "%s", "screen_is_off");
             pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
             goto continue_no_print;
         }
@@ -114,7 +114,7 @@ void *get_foreground_appname(void *android_version)
         //将前台应用包名赋值给ForegroundAppName
         pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
         memset((void *)ForegroundAppName, 0, sizeof(ForegroundAppName));
-        strncpy((char *)ForegroundAppName, tmpchar1, APP_PACKAGE_NAME_MAX_SIZE);
+        snprintf((char *)ForegroundAppName, FOREGROUND_APP_STRING_MAX_SIZE, "%s", tmpchar1);
         pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
         sleep(5);
         pthread_testcancel();

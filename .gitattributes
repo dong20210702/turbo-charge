@@ -1,0 +1,19 @@
+# 强制脚本与源码使用 LF 换行
+# 原因：Windows 上 core.autocrlf=true 时，checkout 会把 .sh 转成 CRLF，
+# 打进模块 zip 后安卓执行会报 "\r: not found"，模块直接装不上
+* text=auto
+*.sh   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+*.txt  text eol=lf
+*.prop text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+update-binary  text eol=lf
+updater-script text eol=lf
+
+# 二进制文件不做换行转换
+*.zip  binary
+*.png  binary
+*.jpg  binary

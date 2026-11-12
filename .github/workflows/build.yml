@@ -1,21 +1,37 @@
 name: Build
 
+# 触发方式：
+#   1. push 到 main            -> 自动编译、校验、上传产物
+#   2. 手动触发（可强制发布）   -> 编译后发布
+#   3. PR                      -> 只编译校验
+# 发布规则：module.prop 的 versionCode 比线上 update_channel/turbo-charge.json 大时才发布，
+#          也就是「改代码 -> 升版本号 -> push」即自动出包、自动更新 OTA 通道。
 on:
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "强制发布（versionCode 未提升也发布）"
+        type: boolean
+        default: false
   push:
     branches:
       - 'main'
     paths-ignore:
       - '**.md'
-      - '**.zip'
-      - '**.json'
+      - 'update_channel/**'
       - '.github/ISSUE_TEMPLATE/**'
   pull_request:
     branches:
       - 'main'
 
+permissions:
+  contents: write
+
 env:
   HOME: "${{ github.workspace }}"
+  # 固定 mimalloc 版本，避免上游 dev3 分支漂移导致某天突然编译失败；升级时改这里即可
+  MIMALLOC_REF: "v3.6.1"
+  REPO_SLUG: "${{ github.repository }}"
 
 jobs:
   build:
@@ -23,37 +39,130 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ssh git make cmake
+          sudo apt-get install -y git make cmake zip unzip jq curl file
+
       - name: Clone aarch64-linux-musl-gcc
-        run: git clone https://github.com/chase535/aarch64-linux-musl-gcc.git ${HOME}/aarch64-linux-musl-gcc -b main --depth=1
+        run: git clone --depth=1 -b main https://github.com/chase535/aarch64-linux-musl-gcc.git "${HOME}/aarch64-linux-musl-gcc"
+
       - name: Set C and C++ compiler
         run: |
-          echo "CC=${HOME}/aarch64-linux-musl-gcc/bin/aarch64-linux-musl-gcc" >> ${GITHUB_ENV}
-          echo "CXX=${HOME}/aarch64-linux-musl-gcc/bin/aarch64-linux-musl-g++" >> ${GITHUB_ENV}
+          echo "CC=${HOME}/aarch64-linux-musl-gcc/bin/aarch64-linux-musl-gcc" >> "${GITHUB_ENV}"
+          echo "CXX=${HOME}/aarch64-linux-musl-gcc/bin/aarch64-linux-musl-g++" >> "${GITHUB_ENV}"
+
+      # 失败不中断：CMakeLists 在找不到 mimalloc 时会自动回退到标准 malloc
       - name: Clone and build mimalloc
+        continue-on-error: true
         run: |
-          git clone https://github.com/microsoft/mimalloc.git ${HOME}/mimalloc -b dev3
-          cd ${HOME}/mimalloc
-          mimalloc_version="$(git describe --abbrev=0 --tags | sed "s|^v||g")"
-          echo "MIMALLOC_VERSION=${mimalloc_version}" >> ${GITHUB_ENV}
-          mkdir -p ${HOME}/mimalloc/out
-          cd ${HOME}/mimalloc/out
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DMI_BUILD_STATIC=ON -DMI_BUILD_SHARED=OFF -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF -DMI_SECURE=OFF
-          make -j$(nproc --all)
-          sudo make install -j$(nproc --all)
+          set -e
+          git clone --depth=1 -b "${MIMALLOC_REF}" https://github.com/microsoft/mimalloc.git "${HOME}/mimalloc"
+          mkdir -p "${HOME}/mimalloc/out"
+          cd "${HOME}/mimalloc/out"
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+                   -DCMAKE_SYSTEM_NAME=Linux \
+                   -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                   -DMI_BUILD_STATIC=ON -DMI_BUILD_SHARED=OFF \
+                   -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF -DMI_SECURE=OFF
+          make -j"$(nproc --all)"
+          sudo make install -j"$(nproc --all)"
+          echo "MIMALLOC_VERSION=${MIMALLOC_REF#v}" >> "${GITHUB_ENV}"
+
       - name: Build module
         run: |
-          cmake -B build
-          make -C build -j$(nproc --all)
-      - name: Copy files into module directory
+          set -euo pipefail
+          cmake -B build 2>&1 | tee cmake.log
+          grep -q "use mimalloc" cmake.log || echo "::warning::未找到 mimalloc，本次构建回退为标准 malloc"
+          make -C build -j"$(nproc --all)"
+          echo "=== 产物类型 ==="
+          file build/turbo-charge
+
+      - name: Pack module zip
         run: |
-          cp -f ${HOME}/README.md ${HOME}/LICENSE ${HOME}/module
-          cp -f ${HOME}/build/turbo-charge ${HOME}/module/common
-      - name : Zip and upload module
+          set -e
+          cp -f README.md LICENSE Changelog_All.md module/
+          cp -f build/turbo-charge module/common/
+          chmod 0755 module/common/turbo-charge module/common/service.sh module/common/uninstall.sh module/customize.sh
+          rm -f turbo-charge.zip
+          cd module
+          zip -r9 ../turbo-charge.zip . -x '.*' -x '*/.*'
+          cd ..
+          echo "=== zip 内容 ==="
+          unzip -l turbo-charge.zip
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: turbo-charge
-          path: ${{ github.workspace }}/module/*
+          path: |
+            turbo-charge.zip
+            module/
+
+      - name: Publish release and update OTA channel
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' module/module.prop | tr -d '\r')"
+          vcode="$(sed -n 's/^versionCode=//p' module/module.prop | tr -d '\r')"
+          echo "本地版本: ${version} (versionCode ${vcode})"
+
+          online_code="$(curl -fsSL --max-time 20 "https://raw.githubusercontent.com/${REPO_SLUG}/main/update_channel/turbo-charge.json" | jq -r '.versionCode // "0"' 2>/dev/null || echo 0)"
+          echo "线上版本码: ${online_code}"
+
+          if [ "${vcode}" -le "${online_code}" ] && [ "${FORCE_PUBLISH:-false}" != "true" ]; then
+            echo "::notice::versionCode 未提升（${vcode} <= ${online_code}），只编译不发布"
+            exit 0
+          fi
+          echo "::notice::开始发布 ${version}"
+
+          # 1. 更新 OTA 通道文件：zip + json（json 指向 jsdelivr，国内可直连）
+          cp -f turbo-charge.zip update_channel/turbo-charge.zip
+          jq -n --arg v "${version}" --arg c "${vcode}" \
+                --arg zu "https://cdn.jsdelivr.net/gh/${REPO_SLUG}@main/update_channel/turbo-charge.zip" \
+                --arg cl "https://cdn.jsdelivr.net/gh/${REPO_SLUG}@main/update_channel/changelog.md" \
+             '{version: $v, versionCode: $c, zipUrl: $zu, changelog: $cl}' \
+             > update_channel/turbo-charge.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f update_channel/turbo-charge.zip update_channel/turbo-charge.json
+          if git diff --cached --quiet; then
+            echo "OTA 文件无变化"
+          else
+            git commit -m "发布 ${version}（versionCode ${vcode}）[skip ci]"
+            git push origin HEAD:main
+          fi
+
+          # 2. 打 tag + GitHub Release（资产名固定为 turbo-charge.zip，便于 latest/download 直链）
+          if ! git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+            git tag -a "${version}" -m "${version}"
+            git push origin "refs/tags/${version}"
+          fi
+
+          awk '/^# v/{n++} n<2' update_channel/changelog.md > release_body.md
+          printf '\n\n**下载**：[一键下载模块 zip](https://github.com/%s/releases/latest/download/turbo-charge.zip)\n' "${REPO_SLUG}" >> release_body.md
+
+          if gh release view "${version}" >/dev/null 2>&1; then
+            gh release upload "${version}" turbo-charge.zip --clobber
+          else
+            gh release create "${version}" turbo-charge.zip --title "${version}" --notes-file release_body.md
+          fi
+
+          # 3. 刷新 jsdelivr 缓存，让 OTA 立刻生效
+          for p in update_channel/turbo-charge.json update_channel/turbo-charge.zip update_channel/changelog.md; do
+            curl -fsS "https://purge.jsdelivr.net/gh/${REPO_SLUG}@main/${p}" >/dev/null || true
+          done
+
+          {
+            echo "## 已发布 ${version} (versionCode ${vcode})"
+            echo ""
+            echo "- OTA 通道: https://cdn.jsdelivr.net/gh/${REPO_SLUG}@main/update_channel/turbo-charge.json"
+            echo "- Release: https://github.com/${REPO_SLUG}/releases/tag/${version}"
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -34,9 +34,19 @@
 
 5.排查“快充不生效”时请先看log.txt：进程是否还在（`ps -A | grep turbo-charge`）、有没有“判定不适配”、有没有限制电流的记录
 
-## CI构建
+## CI构建与自动发版
 
-已经开启CI构建，可在[Actions页面](https://github.com/chase535/turbo-charge/actions)下载CI构建版本以获取最新测试版，**不保证CI构建版本的功能性及稳定性**
+本仓库（fork）已接入完整自动化，全部在 [Actions](https://github.com/dong20210702/turbo-charge/actions) 完成：
+
+1.**自动编译**：push 到 main / 提 PR 都会用官方交叉编译工具链编译一次，产物在对应运行的 Artifacts 里。编译带 `-W -Wall -Werror`，代码有告警即失败，所以能编过就代表没引入新的坏味道
+
+2.**自动发版**：push 时 CI 会读 `module/module.prop` 的 versionCode，只有比线上 `update_channel/turbo-charge.json` 里的大才会发布。发布动作包括：打 tag、建 GitHub Release、把 zip 写回 `update_channel/`、刷新 OTA 通道、清 jsdelivr 缓存。**所以升级流程只有三步：改代码 → 调高 version 和 versionCode → push**
+
+3.**自动升级**：模块的 updateJson 指向 jsdelivr 上的 OTA 通道（`https://cdn.jsdelivr.net/gh/dong20210702/turbo-charge@main/update_channel/turbo-charge.json`），Magisk 打开模块页时会比对 versionCode 并提示更新，点一下即在 Magisk 内完成升级。注意它不会静默自动安装，是"提示 + 一键升级"
+
+4.想强制重发同一个 versionCode，去 Actions 手动跑 Build 并勾选 `force_publish`
+
+> 说明：Magisk 不会定期静默升级，需要打开 Magisk App 的模块页才会检查；updateJson 是模块安装时写进设备的，所以从旧版（v68 及之前，指向作者的 gitee 通道）升到本仓库的版本，需要手动刷一次 v69，之后才会走本仓库的 OTA 通道。
 
 ## 开源协议
 
