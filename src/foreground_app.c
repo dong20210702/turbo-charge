@@ -12,6 +12,16 @@
 
 //全局变量，用于存储当前前台应用的包名
 volatile char ForegroundAppName[FOREGROUND_APP_STRING_MAX_SIZE]={0};
+//子线程是否在运行的标志位，只有通过它才能保证同一时刻最多只有一个子线程
+static volatile int fg_thread_alive=0;
+
+//子线程被pthread_cancel取消时不会执行函数末尾的代码，需要靠清理函数复位标志位，
+//否则标志位永远为1，此后再也不会重新创建子线程（“伪”旁路供电从此彻底失效）
+static void fg_thread_cleanup(void *arg)
+{
+    (void)arg;
+    fg_thread_alive=0;
+}
 
 /*
 获取前台应用的包名以配合“伪”旁路供电功能使用
@@ -20,13 +30,15 @@ volatile char ForegroundAppName[FOREGROUND_APP_STRING_MAX_SIZE]={0};
 */
 void *get_foreground_appname(void *android_version)
 {
+    pthread_cleanup_push(fg_thread_cleanup, NULL);
     while(read_one_option("BYPASS_CHARGE") == 1)
     {
         //在循环体内定义变量，这样变量仅存在于单次循环，每次循环结束后变量自动释放，循环开始时变量重新定义
         char result[2 * APP_PACKAGE_NAME_MAX_SIZE]={0},*tmpchar1,*tmpchar2;
         FILE *fp;
         //判断是否为锁屏状态，如果是则无法获取应用包名，直接将全局变量ForegroundAppName赋值为screen_is_off
-        fp=popen("dumpsys deviceidle | grep 'mScreenOn'", "r");
+        //"re"：关闭子进程继承的文件描述符，避免每次popen都泄漏一个fd
+        fp=popen("dumpsys deviceidle | grep 'mScreenOn'", "re");
         if(fp == NULL)
         {
             printf_with_time("无法创建管道通信，跳过本次循环！");
@@ -37,7 +49,7 @@ void *get_foreground_appname(void *android_version)
             pthread_testcancel();
             continue;
         }
-        fgets(result, sizeof(result), fp);
+        if(fgets(result, sizeof(result), fp) == NULL) result[0]='\0';
         pclose(fp);
         fp=NULL;
         line_feed(result);
@@ -52,6 +64,7 @@ void *get_foreground_appname(void *android_version)
         if(strcmp(tmpchar1+1, "true"))
         {
             pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
+            memset((void *)ForegroundAppName, 0, sizeof(ForegroundAppName));
             strncpy((char *)ForegroundAppName, "screen_is_off", APP_PACKAGE_NAME_MAX_SIZE);
             pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
             goto continue_no_print;
@@ -62,13 +75,13 @@ void *get_foreground_appname(void *android_version)
         安卓10以下就只能用dumpsys activity o获取，执行效率慢
         然后再使用grep提取出包含关键字的行，此行即为前台应用的详情
         */
-        fp=(*((int *)android_version) < 10)?popen("dumpsys activity o | grep ' (top-activity)'", "r"):popen("dumpsys activity lru | grep ' TOP'", "r");
+        fp=(*((int *)android_version) < 10)?popen("dumpsys activity o | grep ' (top-activity)'", "re"):popen("dumpsys activity lru | grep ' TOP'", "re");
         if(fp == NULL)
         {
             printf_with_time("无法创建管道通信，跳过本次循环！");
             goto continue_no_print;
         }
-        fgets(result, sizeof(result), fp);
+        if(fgets(result, sizeof(result), fp) == NULL) result[0]='\0';
         pclose(fp);
         fp=NULL;
         line_feed(result);
@@ -84,15 +97,23 @@ void *get_foreground_appname(void *android_version)
             printf_with_time("无法获取前台应用包名，跳过本次循环！");
             goto continue_no_print;
         }
-        tmpchar2=(*((int *)android_version) < 10)?strstr(strstr(tmpchar1, ":")+1, ":"):strstr(tmpchar1, ":");
+        //旧版本直接对strstr的返回值+1，某些机型的输出缺少分隔符时会解引用空指针，导致整个程序崩溃
+        if(*((int *)android_version) < 10)
+        {
+            tmpchar2=strstr(tmpchar1, ":");
+            if(tmpchar2 == NULL) goto can_not_get_package;
+            tmpchar2=strstr(tmpchar2+1, ":");
+        }
+        else tmpchar2=strstr(tmpchar1, ":");
         if(tmpchar2 == NULL) goto can_not_get_package;
         tmpchar1=strstr(tmpchar2, "/");
         if(tmpchar1 == NULL) goto can_not_get_package;
         *tmpchar1='\0';
-        tmpchar1 = tmpchar2+1;
+        tmpchar1=tmpchar2+1;
         pthread_testcancel();
         //将前台应用包名赋值给ForegroundAppName
         pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
+        memset((void *)ForegroundAppName, 0, sizeof(ForegroundAppName));
         strncpy((char *)ForegroundAppName, tmpchar1, APP_PACKAGE_NAME_MAX_SIZE);
         pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
         sleep(5);
@@ -102,22 +123,23 @@ void *get_foreground_appname(void *android_version)
     pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
     memset((void *)ForegroundAppName, 0, sizeof(ForegroundAppName));
     pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
 //获取安卓版本，因为只有安卓7及以上才能使用Shell命令获取安卓版本
 int check_android_version()
 {
-    char android_version_char[5];
+    char android_version_char[8]={0};
     int android_version=0;
     FILE *fp=NULL;
-    fp=popen("getprop ro.build.version.release", "r");
+    fp=popen("getprop ro.build.version.release", "re");
     if(fp == NULL)
     {
         printf_with_time("无法创建管道通信，故无法获取安卓版本，“伪”旁路供电功能失效！");
         return 0;
     }
-    fgets(android_version_char, sizeof(android_version_char), fp);
+    if(fgets(android_version_char, sizeof(android_version_char), fp) == NULL) android_version_char[0]='\0';
     line_feed(android_version_char);
     pclose(fp);
     fp=NULL;
@@ -133,4 +155,28 @@ int check_android_version()
         return 0;
     }
     return android_version;
+}
+
+/*
+保证同一时刻最多只有一个获取前台应用包名的子线程
+返回1代表子线程正在运行（本次创建成功或本来就在跑），返回0代表创建失败
+*/
+int start_foreground_appname_thread(pthread_t *thread, int *android_version)
+{
+    if(thread == NULL) return 0;
+    if(fg_thread_alive) return 1;
+    fg_thread_alive=1;
+    if(pthread_create(thread, NULL, get_foreground_appname, (void *)android_version) != 0)
+    {
+        fg_thread_alive=0;
+        printf_with_time("无法创建获取前台应用包名的子线程，5秒后重试");
+        return 0;
+    }
+    pthread_detach(*thread);
+    return 1;
+}
+
+int foreground_thread_alive()
+{
+    return fg_thread_alive;
 }

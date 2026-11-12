@@ -3,50 +3,60 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "value_set.h"
 
 /*
-向文件写入数据
-若文件存在且不可写，尝试修改权限后重新检查是否可写
-若文件不存在或修改权限后仍不可写，则跳过本次写操作
+向文件写入数据，返回1代表发生了写入，0代表内容本来就一致（未写入），-1代表写入失败或文件不存在
+运行期间节点短暂不可用是正常现象（拔插充电器、驱动重新注册节点），本函数只跳过本次写操作，绝不结束进程
+使用原始文件IO而不是标准C的流：内核属性文件不支持随意定位，fopen/fgets/rewind/fputs这套组合
+在部分节点上会写不进去（v67之前反复出现的“写不进电流”就是同一个原因）
 */
-void set_value(char *file, char *numb)
+int set_value(char *file, char *numb)
 {
-    if(!access(file, F_OK))
+    int fd;
+    ssize_t len=0,value_len=0;
+    char content[64]={0};
+    if(file == NULL || numb == NULL) return -1;
+    value_len=(ssize_t)strlen(numb);
+    fd=open(file, O_RDWR);
+    if(fd < 0)
     {
-        FILE *fn;
-        struct stat statbuf;
-        stat(file, &statbuf);
-        char content[statbuf.st_size+1];
-        fn=fopen(file, "rt+");
-        if(fn != NULL) goto write_data;
-        else
+        //权限0644不得简写成644
+        chmod(file, 0644);
+        fd=open(file, O_RDWR);
+        //部分节点是只写属性，读不了但能写
+        if(fd < 0) fd=open(file, O_WRONLY);
+        if(fd < 0) return -1;
+    }
+    len=read(fd, content, sizeof(content)-1);
+    if(len > 0)
+    {
+        content[len]='\0';
+        line_feed(content);
+        //先判断文件内容与所写内容是否一致，若不一致才进行写入
+        if(!strcmp(content, numb))
         {
-            //权限0644不得简写成644
-            chmod(file, 0644);
-            fn=fopen(file, "rt+");
-            if(fn != NULL)
-            {
-                write_data:
-                fgets(content, statbuf.st_size+1, fn);
-                line_feed(content);
-                //先判断文件内容与所写内容是否一致，若不一致才进行写入
-                if(strcmp(content, numb))
-                {
-                    rewind(fn);
-                    fputs(numb, fn);
-                }
-                fclose(fn);
-                fn=NULL;
-            }
+            close(fd);
+            return 0;
         }
     }
+    //回到文件开头再写，内核节点只接受从偏移0开始的一次写入
+    if(lseek(fd, 0, SEEK_SET) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+    len=write(fd, numb, value_len);
+    close(fd);
+    return (len == value_len)?1:-1;
 }
 
 //向二级指针所指向的文件们写入数据
 void set_array_value(char **file, int num, char *value)
 {
+    if(file == NULL || value == NULL) return;
     for(int i=0;i < num;i++) set_value(file[i], value);
 }
 
@@ -56,16 +66,18 @@ tempwall为是否启用超过一定温度时强制向温度文件写入28℃
 */
 void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar tempwall)
 {
-    char thermal[15]={0},bat_temp[6]={0};
-    int temp_int=0;
+    char thermal[15]={0},bat_temp[8]={0};
+    int raw_temp=0,temp_int=0;
+    if(temp_sensor == NULL) return;
     //读取温度文件
-    read_file(temp_sensor, thermal, sizeof(thermal));
-    temp_int=atoi(thermal);
-    //若温度为正数，则将温度扩展为6位数并取前3位数
-    //若温度为负数，则将温度扩展为负号+5位数并取负号+前3位数
-    (temp_int < 0)?snprintf(bat_temp, 5, "%06d", temp_int):snprintf(bat_temp, 4, "%05d", temp_int);
-    temp_int=atoi(bat_temp);
-    snprintf(bat_temp, 6, "%d", temp_int);
+    if(!read_file(temp_sensor, thermal, sizeof(thermal))) return;
+    raw_temp=atoi(thermal);
+    //0、1、-1是节点不可用时的占位值，直接丢弃，避免把“读不到温度”当成“温度很低”
+    if(raw_temp <= 1) return;
+    //thermal_zone的temp单位是0.001℃，power_supply的temp单位是0.1℃，直接除以100取整
+    //旧版本用snprintf截断字符串来换算，温度低于10℃或为负数时会被算错（9.5℃→95℃、-5℃→-50℃）
+    temp_int=raw_temp/100;
+    snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int);
     //如果tempwall为1，则判断温度是否超过指定值，若超过则强制显示28度，否则显示正常温度
     //如果tempwall为0，则永远显示正常温度
     if(tempwall) (temp_int >= 450)?set_array_value(temp_file, temp_file_num, "280"):set_array_value(temp_file, temp_file_num, bat_temp);

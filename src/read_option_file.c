@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 
 #include "read_option_file.h"
@@ -18,7 +19,9 @@
 */
 void *read_option_file(void *arg)
 {
-    int sleep_time=*(int *)arg, first_run=1;
+    int sleep_time=*(int *)arg, first_pass=1, need_wait=0;
+    //上一次成功解析时配置文件的修改时间，用于 inotify 漏报时的兜底比较
+    time_t last_mtime=-1;
     //监视配置文件所在目录而非文件本身，以正确处理编辑器的原子保存（先写临时文件再重命名）
     char opt_dir[PATH_MAX], opt_name[NAME_MAX+1];
     strncpy(opt_dir, option_file, sizeof(opt_dir)-1);
@@ -50,7 +53,7 @@ void *read_option_file(void *arg)
     }
     while(1)
     {
-        if(!first_run)
+        if(need_wait)
         {
             if(ifd < 0)
             {
@@ -58,35 +61,52 @@ void *read_option_file(void *arg)
             }
             else
             {
-                //使用 poll 阻塞等待 inotify 事件，超时时间为 sleep_time 秒
-                //超时后触发周期性兜底重载，以防 inotify 漏报
+                /*
+                使用poll等待inotify事件，超时时间取sleep_time秒
+                旧版本超时时间写成-1（永远阻塞），一旦inotify漏报一次（队列溢出、监视被内核回收），
+                本线程就再也醒不过来，用户在配置文件里改的东西全部不生效，只能重启手机
+                */
                 struct pollfd pfd={ifd, POLLIN, 0};
-                int sel=poll(&pfd, 1, -1);
+                int sel=poll(&pfd, 1, sleep_time*1000);
                 if(sel < 0)
                 {
-                    printf_with_time("poll函数的返回值为-1，程序出现内部错误，强制停止运行！");
-                    exit(8721);
+                    if(errno == EINTR) continue;
+                    printf_with_time("poll函数出错，关闭inotify并降级为周期性轮询");
+                    close(ifd);
+                    ifd=-1;
+                    continue;
                 }
-                //读取 inotify 事件队列，仅当有与配置文件相关的事件时才重载
-                int relevant=0;
-                char evbuf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-                ssize_t n;
-                while((n=read(ifd, evbuf, sizeof(evbuf))) > 0)
+                //超时后不直接重载，先用修改时间做一次兜底判断，避免无谓的重复解析
+                int relevant=(sel == 0)?-1:0;
+                if(sel > 0)
                 {
-                    char *ptr=evbuf;
-                    while(ptr < evbuf+n)
+                    //读取 inotify 事件队列，仅当有与配置文件相关的事件时才重载
+                    char evbuf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+                    ssize_t n;
+                    while((n=read(ifd, evbuf, sizeof(evbuf))) > 0)
                     {
-                        struct inotify_event *ev=(struct inotify_event *)ptr;
-                        if(ev->len > 0 && ev->name[0] != '\0' && strcmp(ev->name, opt_name) == 0) relevant=1;
-                        ptr+=sizeof(struct inotify_event)+ev->len;
+                        char *ptr=evbuf;
+                        while(ptr < evbuf+n)
+                        {
+                            struct inotify_event *ev=(struct inotify_event *)ptr;
+                            if(ev->len > 0 && ev->name[0] != '\0' && strcmp(ev->name, opt_name) == 0) relevant=1;
+                            ptr+=sizeof(struct inotify_event)+ev->len;
+                        }
                     }
                 }
-                if(!relevant) continue;
+                if(relevant == 0) continue;
+                if(relevant < 0)
+                {
+                    struct stat mtime_buf;
+                    if(stat(option_file, &mtime_buf) || mtime_buf.st_mtime == last_mtime) continue;
+                }
             }
         }
+        //无论本次读取成功与否，都转入“等待”状态，避免文件持续不可读时(读取失败后continue)在本循环里空转烧CPU
+        need_wait=1;
         //在循环体内定义变量，这样变量仅存在于单次循环，每次循环结束后变量自动释放，循环开始时变量重新定义
         char option_tmp[42]={0},option[100]={0},*value=NULL;
-        uchar opt=0,i=0,option_quantity=1;
+        int opt=0,i=0,option_quantity=1;
         int new_value=0;
         struct stat statbuf;
         ListNode *node=options_head.next,*tmp=options_head.next;
@@ -98,7 +118,11 @@ void *read_option_file(void *arg)
         while((tmp=tmp->next) != NULL) option_quantity++;
         //不定长数组无法在定义时初始化为全0，所以后续会使用memset进行清零
         uchar value_stat[option_quantity];
-        check_read_file(option_file);
+        if(!check_read_file(option_file))
+        {
+            printf_with_time("配置文件暂时无法读取，跳过本次配置获取");
+            continue;
+        }
         memset(value_stat, 0, sizeof(value_stat));
         pthread_mutex_lock((pthread_mutex_t *)&mutex_options);
         int fd=open(option_file, O_RDONLY);
@@ -115,6 +139,7 @@ void *read_option_file(void *arg)
             printf_with_time("无法获取配置文件信息，跳过本次配置获取");
             continue;
         }
+        last_mtime=statbuf.st_mtime;
         if(statbuf.st_size > 0)
         {
             char *map=mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -148,7 +173,7 @@ void *read_option_file(void *arg)
                     else
                     {
                         value=option+strlen(option_tmp);
-                        for(i=0;i < strlen(value);i++)
+                        for(i=0;i < (int)strlen(value);i++)
                         {
                             if((value[i] < '0' || value[i] > '9') && ((!i && (value[i] != '-' || strlen(value) == 1)) || i))
                             {
@@ -158,7 +183,15 @@ void *read_option_file(void *arg)
                         }
                     }
                     if(value_stat[opt] != 10) continue;
-                    new_value=atoi(value);
+                    //旧版本直接用atoi转换，配置值超过2147483647时是未定义行为（配置文件里也写了“会出现BUG”），
+                    //这里改用strtol并显式做范围检查
+                    long parsed_value=strtol(value, NULL, 10);
+                    if(parsed_value > (long)INT_MAX)
+                    {
+                        value_stat[opt]=5;
+                        continue;
+                    }
+                    new_value=(int)parsed_value;
                     if(new_value < 0) value_stat[opt]=3;
                     else if(!strcmp((char *)(node->name), "CYCLE_TIME") && !new_value) value_stat[opt]=4;
                     if(value_stat[opt] == 10 && node->value != new_value)
@@ -177,13 +210,14 @@ void *read_option_file(void *arg)
         for(opt=0,node=options_head.next;node;opt++,node=node->next)
         {
             //通过判断是否第一次运行来进行不同的字符串输出
-            if(!first_run)
+            if(!first_pass)
             {
                 if(value_stat[opt] == 0) printf_with_time("配置文件中%s不存在，故程序沿用上一次的值%d", node->name, node->value);
                 else if(value_stat[opt] == 1) printf_with_time("新%s的值为空，故程序沿用上一次的值%d", node->name, node->value);
                 else if(value_stat[opt] == 2) printf_with_time("新%s的值不是由纯数字组成，故程序沿用上一次的值%d", node->name, node->value);
                 else if(value_stat[opt] == 3) printf_with_time("新%s的值小于0，这是不被允许的，故程序沿用上一次的值%d", node->name, node->value);
                 else if(value_stat[opt] == 4) printf_with_time("新%s的值为0，这是不被允许的，故程序沿用上一次的值%d", node->name, node->value);
+                else if(value_stat[opt] == 5) printf_with_time("新%s的值超过2147483647，这是不被允许的，故程序沿用上一次的值%d", node->name, node->value);
                 else if(value_stat[opt] == 100) printf_with_time("%s的值更改为%d", node->name, node->value);
             }
             else
@@ -193,9 +227,10 @@ void *read_option_file(void *arg)
                 else if(value_stat[opt] == 2) printf_with_time("配置文件中%s的值不是由纯数字组成，故程序使用默认值%d", node->name, node->value);
                 else if(value_stat[opt] == 3) printf_with_time("配置文件中%s的值小于0，这是不被允许的，故程序使用默认值%d", node->name, node->value);
                 else if(value_stat[opt] == 4) printf_with_time("配置文件中%s的值为0，这是不被允许的，故程序使用默认值%d", node->name, node->value);
+                else if(value_stat[opt] == 5) printf_with_time("配置文件中%s的值超过2147483647，这是不被允许的，故程序使用默认值%d", node->name, node->value);
             }
         }
-        first_run=0;
+        first_pass=0;
         pthread_mutex_unlock((pthread_mutex_t *)&mutex_options);
     }
     return NULL;

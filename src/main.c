@@ -4,7 +4,9 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 
 #include "main.h"
 #include "read_option_file.h"
@@ -15,33 +17,53 @@
 #include "value_set.h"
 #include "foreground_app.h"
 
+//重新向内核节点施加各项“解锁”参数的周期（单位:s）
+//系统（温控服务、充电HAL、PD重新协商）会在运行过程中把某些节点改回默认值，
+//只在启动时写一次的话，拔插充电器或协议重协商后就可能失去快充，所以需要周期性复查
+#define REAPPLY_INTERVAL 30
+//电流类配置的下限保护（单位:μA），配置为0或过小时内核会直接停止充电
+#define CURRENT_MIN_LIMIT 100000
+
 /*
 列出path目录下的所有文件夹并赋值给二级指针变量ppp
 第二个参数是二级指针的地址
 返回值是文件夹的个数
+容量按需翻倍，避免目录条目过多时越界写坏堆
 */
 int list_dir(char *path, char ***ppp)
 {
     DIR *pDir;
     struct dirent *ent;
-    int file_num=0;
+    int file_num=0,cap=64;
     pDir=opendir(path);
-    if(pDir != NULL)
+    if(pDir == NULL) return 0;
+    *ppp=(char **)my_realloc(*ppp, sizeof(char *)*cap);
+    while((ent=readdir(pDir)) != NULL)
     {
-        //重新分配一个足够大的内存，用来记录文件夹的个数
-        *ppp=(char **)my_realloc(*ppp, sizeof(char *)*500);
-        while((ent=readdir(pDir)) != NULL)
+        if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        if(file_num >= cap)
         {
-            if(!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-            //分配一个与路径字符串大小相等的内存，用来装路径
-            (*ppp)[file_num]=(char *)my_calloc(1, sizeof(char)*((strlen(path)+strlen(ent->d_name))+2));
-            //拼接路径及文件夹名
-            sprintf((*ppp)[file_num], "%s/%s", path, ent->d_name);
-            file_num++;
+            cap*=2;
+            *ppp=(char **)my_realloc(*ppp, sizeof(char *)*cap);
         }
-        closedir(pDir);
-        //收缩内存
-        *ppp=(char **)my_realloc(*ppp, sizeof(char *)*file_num);
+        //分配一个与路径字符串大小相等的内存，用来装路径
+        (*ppp)[file_num]=(char *)my_calloc(1, sizeof(char)*(strlen(path)+strlen(ent->d_name)+2));
+        //拼接路径及文件夹名
+        if((size_t)sprintf((*ppp)[file_num], "%s/%s", path, ent->d_name) >= sizeof(char)*(strlen(path)+strlen(ent->d_name)+2))
+        {
+            my_free((*ppp)[file_num]);
+            (*ppp)[file_num]=NULL;
+            continue;
+        }
+        file_num++;
+    }
+    closedir(pDir);
+    //收缩内存
+    if(file_num) *ppp=(char **)my_realloc(*ppp, sizeof(char *)*file_num);
+    else
+    {
+        my_free(*ppp);
+        *ppp=NULL;
     }
     return file_num;
 }
@@ -50,6 +72,7 @@ int list_dir(char *path, char ***ppp)
 void line_feed(char *line)
 {
     char *p;
+    if(line == NULL) return;
     p=strchr(line, '\r');
     if(p != NULL) *p='\0';
     p=strchr(line, '\n');
@@ -57,62 +80,107 @@ void line_feed(char *line)
 }
 
 /*
-检查文件是否可读
-若文件存在且不可读，延时0.25秒后重新检查
-检查两次是为了兼容在本程序检查时刚好被系统的其他进程锁住（如刚好进行了文件的保存操作）导致的无法读取
-若仍不可读尝试修改权限后重新检查是否可读
-若文件不存在或修改权限后仍不可读，则强制停止程序运行
+检查文件是否可读，可读返回1，不可读返回0
+若文件暂时不存在，延时0.25秒后重新检查，兼容驱动重新注册节点、编辑器原子保存等瞬时状态
+注意：本函数不再结束进程。运行期间某个节点短暂消失是正常现象（例如拔插充电器、温控服务重启），
+旧版本在这里直接exit，会导致模块在后台静默退出，从而出现“用着用着快充就没了”的现象
 */
-void check_read_file(char *file)
+int check_read_file(char *file)
 {
-    if(!access(file, F_OK))
+    struct timespec req={0, 250000000L};
+    if(file == NULL) return 0;
+    if(access(file, F_OK))
     {
-        check_permission:
-        if(access(file, R_OK))
-        {
-            //权限0644不得简写成644
-            chmod(file, 0644);
-            if(!access(file, R_OK)) return;
-            printf_with_time("无法读取%s文件，程序强制退出！", file);
-            exit(1);
-        }
-    }
-    else
-    {
-        struct timespec req={0, 250000000L};
         nanosleep(&req, NULL);
-        if(!access(file, F_OK)) goto check_permission;
-        else
-        {
-            printf_with_time("找不到%s文件，程序强制退出！", file);
-            exit(999);
-        }
+        if(access(file, F_OK)) return 0;
     }
+    if(!access(file, R_OK)) return 1;
+    //权限0644不得简写成644
+    chmod(file, 0644);
+    return !access(file, R_OK);
 }
 
-//读取文件内容，若文件不存在则程序强制退出
-void read_file(char *file_path, char *char_var, int max_char_num)
+//读取文件内容，成功返回1，失败返回0（失败时char_var保持原内容）
+int read_file(char *file_path, char *char_var, int max_char_num)
 {
     FILE *fp;
-    check_read_file(file_path);
+    if(!check_read_file(file_path)) return 0;
     fp=fopen(file_path, "rt");
-    fgets(char_var, max_char_num, fp);
+    if(fp == NULL) return 0;
+    if(fgets(char_var, max_char_num, fp) == NULL)
+    {
+        fclose(fp);
+        fp=NULL;
+        return 0;
+    }
     fclose(fp);
     fp=NULL;
     line_feed(char_var);
+    return 1;
 }
 
-//查找可用温度传感器
-int find_temp_sensor(char *temp_sensor)
+//同一类错误信息最多每60秒输出一次，避免节点持续不可用时把日志刷爆
+static int should_log()
+{
+    static time_t last_log_time=0;
+    time_t now=time(NULL);
+    if(now - last_log_time < 60) return 0;
+    last_log_time=now;
+    return 1;
+}
+
+/*
+保证同一时刻只有一个实例在运行
+重装模块不重启手机、守护脚本重启程序等场景都会让旧实例还没退出就启动了新实例，
+两个实例同时抢写同一批内核节点，表现就是电流忽高忽低、断充，甚至互相把对方的设置改回去
+锁文件句柄故意不关闭，进程退出时由内核自动释放
+返回1代表可以继续运行，0代表已有实例在运行
+*/
+static int ensure_single_instance()
+{
+    static int lock_fd=-1;
+    lock_fd=open("/data/adb/turbo-charge/lock", O_RDWR|O_CREAT, 0644);
+    //锁文件打不开时不阻塞程序运行，保证模块仍然可用
+    if(lock_fd < 0) return 1;
+    if(flock(lock_fd, LOCK_EX|LOCK_NB))
+    {
+        close(lock_fd);
+        lock_fd=-1;
+        return 0;
+    }
+    return 1;
+}
+
+//读取温度传感器的温度值，成功返回1，读数无效返回0
+//0、1、-1是内核在节点不可用时返回的占位值，必须按无效处理，否则会被当成“温度已经降到0度”而误恢复大电流
+static int read_temp(char *temp_sensor, int *temp_int)
+{
+    char thermal[15]={0};
+    int value=0;
+    if(temp_sensor == NULL) return 0;
+    if(!read_file(temp_sensor, thermal, sizeof(thermal))) return 0;
+    value=atoi(thermal);
+    if(value <= 1 || value > 200000) return 0;
+    *temp_int=value;
+    return 1;
+}
+
+/*
+查找可用温度传感器，找到则把温度节点的完整路径写入*temp_sensor并返回1，找不到返回0
+注意：温度节点的路径是要交回给主函数长期使用的，所以必须用二级指针输出，
+旧版本用一级指针传参，函数内部无论怎么赋值都不会影响主函数里的变量，
+主函数拿到的永远是NULL，一旦触发温度控制就会因为“找不到文件”而退出进程
+*/
+int find_temp_sensor(char **temp_sensor)
 {
     FILE *fq;
-    struct stat statbuf;
+    struct stat statbuf={0};
     char *temp_sensor_dir = NULL, *buffer = NULL, *temp_tmp = NULL, *msg = NULL;
     char **thermal_dir = NULL;
     int thermal_file_num = 0, i = 0, j = 0, temp_sensor_num = 100;
 
-    //预先分配一个占位用的内存
-    temp_sensor=(char *)my_calloc(1, sizeof(char));
+    if(temp_sensor == NULL) return 0;
+    *temp_sensor=NULL;
     temp_sensor_dir=(char *)my_calloc(1, sizeof(char));
     buffer=(char *)my_calloc(1, sizeof(char));
     temp_tmp=(char *)my_calloc(1, sizeof(char)*15);
@@ -132,15 +200,14 @@ int find_temp_sensor(char *temp_sensor)
             //如果没有type文件或type文件不可读，则跳过此温度传感器的后续操作
             if(access(buffer, R_OK)) continue;
             //获取type文件内的字符个数
-            stat(buffer, &statbuf);
+            if(stat(buffer, &statbuf)) continue;
             fq=fopen(buffer, "rt");
             if(fq == NULL) continue;
             //重新分配内存，使其刚好能够装入该温度传感器的名称，并获取该温度传感器的名称
             msg=(char *)my_realloc(msg, sizeof(char)*(statbuf.st_size+1));
-            fgets(msg, statbuf.st_size+1, fq);
+            if(fgets(msg, statbuf.st_size+1, fq) == NULL) msg[0]='\0';
             fclose(fq);
             fq=NULL;
-            //如果无法通过管道打开type文件，则跳过此温度传感器的后续操作
             line_feed(msg);
             //检查此文件夹下有无temp文件，此文件的内容是该温度传感器所获取的温度值
             sprintf(buffer, "%s/temp", thermal_dir[i]);
@@ -149,7 +216,7 @@ int find_temp_sensor(char *temp_sensor)
             fq=fopen(buffer, "rt");
             if(fq != NULL)
             {
-                fgets(temp_tmp, 10, fq);
+                if(fgets(temp_tmp, 10, fq) == NULL) temp_tmp[0]='\0';
                 fclose(fq);
                 fq=NULL;
             }
@@ -179,26 +246,40 @@ int find_temp_sensor(char *temp_sensor)
     msg=NULL;
     free_malloc_memory(&thermal_dir, thermal_file_num);
     //判断是否获取到了可用的温度传感器
-    if(temp_sensor_num != 100)
+    if(temp_sensor_num != 100 && strlen(temp_sensor_dir))
     {
-        //重新分配内存，使其刚好能够装下路径+“/temp”，因为temp文件内存储的是温度传感器所获取的温度值
-        temp_sensor=(char *)my_realloc(temp_sensor, sizeof(char)*(strlen(temp_sensor_dir)+6));
-        sprintf(temp_sensor, "%s/temp", temp_sensor_dir);
+        //重新分配内存，使其刚好能装下路径+“/temp”，因为temp文件内存储的是温度传感器所获取的温度值
+        *temp_sensor=(char *)my_calloc(1, sizeof(char)*(strlen(temp_sensor_dir)+6));
+        sprintf(*temp_sensor, "%s/temp", temp_sensor_dir);
         printf_with_time("将使用%s温度传感器作为手机温度的获取源。由于每个传感器所处位置不同以及每个手机发热区不同，很可能导致获取到的温度与实际体感温度不同", temp_sensors[temp_sensor_num]);
-        check_read_file(temp_sensor);
         my_free(temp_sensor_dir);
         temp_sensor_dir=NULL;
+        if(!check_read_file(*temp_sensor))
+        {
+            printf_with_time("无法读取%s，温度控制及充电时强制显示28℃功能失效！", *temp_sensor);
+            my_free(*temp_sensor);
+            *temp_sensor=NULL;
+            return 0;
+        }
         return 1;
     }
     //如果没有获取到可用的温度传感器，则返回0
-    else
+    my_free(temp_sensor_dir);
+    temp_sensor_dir=NULL;
+    return 0;
+}
+
+//把匹配到的文件路径追加到动态数组里，容量不足时翻倍
+static void add_path(char ***file, int *num, int *cap, char *path, int path_len)
+{
+    if(*num >= *cap)
     {
-        my_free(temp_sensor_dir);
-        temp_sensor_dir=NULL;
-        my_free(temp_sensor);
-        temp_sensor=NULL;
-        return 0;
+        *cap*=2;
+        *file=(char **)my_realloc(*file, sizeof(char *)*(*cap));
     }
+    (*file)[*num]=(char *)my_calloc(1, sizeof(char)*(path_len+1));
+    strcpy((*file)[*num], path);
+    (*num)++;
 }
 
 /*
@@ -209,13 +290,14 @@ int find_temp_sensor(char *temp_sensor)
 */
 void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar *power_control,
                           uchar *step_charge, uchar *force_temp, uchar *current_change,
-                          int *temp_sensor_num, char *temp_sensor,
+                          int *temp_sensor_num, char **temp_sensor,
                           char ***current_max_file, int *current_max_file_num,
                           char ***current_limit_file, int *current_limit_file_num,
                           char ***temp_file, int *temp_file_num)
 {
     char **power_supply_dir_list = NULL, **power_supply_dir = NULL;
     int i = 0, j = 0, power_supply_file_num = 0, power_supply_dir_list_num = 0, path_len = 0;
+    int current_max_cap = 16, current_limit_cap = 16, temp_cap = 16;
 
     if(access("/sys/class/power_supply/battery/status", F_OK)) *battery_status=0;
     if(access("/sys/class/power_supply/battery/capacity", F_OK)) *battery_capacity=0;
@@ -243,13 +325,12 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
         *step_charge=2;
         printf_with_time("由于找不到/sys/class/power_supply/battery/capacity文件，阶梯式充电无法根据电量进行开关，此时若在配置中关闭阶梯式充电，则无论电量多少，阶梯式充电都会关闭！");
     }
-    //通过字符串后缀匹配来查找相应文件
+    //通过字符串后缀匹配来查找相应文件，容量不足时自动扩容，不再写死100个的上限
     power_supply_dir=(char **)my_calloc(1, sizeof(char *));
     power_supply_file_num=list_dir("/sys/class/power_supply", &power_supply_dir);
-    //预先分配一个足够大的内存，用来记录文件的个数
-    *current_limit_file=(char **)my_calloc(1, sizeof(char *)*100);
-    *current_max_file=(char **)my_calloc(1, sizeof(char *)*100);
-    *temp_file=(char **)my_calloc(1, sizeof(char *)*100);
+    *current_limit_file=(char **)my_calloc(current_limit_cap, sizeof(char *));
+    *current_max_file=(char **)my_calloc(current_max_cap, sizeof(char *));
+    *temp_file=(char **)my_calloc(temp_cap, sizeof(char *));
     //遍历/sys/class/power_supply
     for(i=0;i < power_supply_file_num;i++)
     {
@@ -264,30 +345,27 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
                 || (path_len >= 19 && !strcmp(power_supply_dir_list[j]+path_len-19, "/fast_charge_current"))
                 || (path_len >= 22 && !strcmp(power_supply_dir_list[j]+path_len-22, "/thermal_input_current")))
             {
-                (*current_max_file)[*current_max_file_num]=(char *)my_calloc(1, sizeof(char)*(path_len+1));
-                strcpy((*current_max_file)[*current_max_file_num], power_supply_dir_list[j]);
-                (*current_max_file_num)++;
+                add_path(current_max_file, current_max_file_num, &current_max_cap, power_supply_dir_list[j], path_len);
             }
             else if(path_len >= 28 && !strcmp(power_supply_dir_list[j]+path_len-28, "/thermal_input_current_limit"))
             {
-                (*current_limit_file)[*current_limit_file_num]=(char *)my_calloc(1, sizeof(char)*(path_len+1));
-                strcpy((*current_limit_file)[*current_limit_file_num], power_supply_dir_list[j]);
-                (*current_limit_file_num)++;
+                add_path(current_limit_file, current_limit_file_num, &current_limit_cap, power_supply_dir_list[j], path_len);
             }
             else if(path_len >= 5 && !strcmp(power_supply_dir_list[j]+path_len-5, "/temp"))
             {
-                (*temp_file)[*temp_file_num]=(char *)my_calloc(1, sizeof(char)*(path_len+1));
-                strcpy((*temp_file)[*temp_file_num], power_supply_dir_list[j]);
-                (*temp_file_num)++;
+                add_path(temp_file, temp_file_num, &temp_cap, power_supply_dir_list[j], path_len);
             }
         }
         free_malloc_memory(&power_supply_dir_list, power_supply_dir_list_num);
     }
     free_malloc_memory(&power_supply_dir, power_supply_file_num);
     //收缩内存
-    *current_limit_file=(char **)my_realloc(*current_limit_file, sizeof(char *)*(*current_limit_file_num));
-    *current_max_file=(char **)my_realloc(*current_max_file, sizeof(char *)*(*current_max_file_num));
-    *temp_file=(char **)my_realloc(*temp_file, sizeof(char *)*(*temp_file_num));
+    if(*current_limit_file_num) *current_limit_file=(char **)my_realloc(*current_limit_file, sizeof(char *)*(*current_limit_file_num));
+    else { my_free(*current_limit_file); *current_limit_file=NULL; }
+    if(*current_max_file_num) *current_max_file=(char **)my_realloc(*current_max_file, sizeof(char *)*(*current_max_file_num));
+    else { my_free(*current_max_file); *current_max_file=NULL; }
+    if(*temp_file_num) *temp_file=(char **)my_realloc(*temp_file, sizeof(char *)*(*temp_file_num));
+    else { my_free(*temp_file); *temp_file=NULL; }
     //判断文件数量是否为0
     if(!*current_max_file_num)
     {
@@ -328,13 +406,55 @@ void check_required_files(uchar *battery_status, uchar *battery_capacity, uchar 
     if(*force_temp) for(i=0;i < *temp_file_num;i++) printf_with_time("找到温度文件：%s", (*temp_file)[i]);
 }
 
+/*
+读取电流相关配置并做下限保护
+电流配置成0或极小的值会让内核直接停止充电，表现就是“快充不生效”，
+配置文件的注释里只说了“必须大于等于0”，这个坑必须由程序兜住
+*/
+static void load_current_config(char *current_max_char, int current_max_size, char *highest_temp_current_char, int highest_temp_current_size)
+{
+    snprintf(current_max_char, current_max_size, "%d", read_one_option("CURRENT_MAX"));
+    snprintf(highest_temp_current_char, highest_temp_current_size, "%d", read_one_option("HIGHEST_TEMP_CURRENT"));
+    if(atoi(current_max_char) < CURRENT_MIN_LIMIT)
+    {
+        snprintf(current_max_char, current_max_size, "%d", CURRENT_MIN_LIMIT);
+        if(should_log()) printf_with_time("CURRENT_MAX的配置值过小，已按%dμA处理", CURRENT_MIN_LIMIT);
+    }
+    if(atoi(highest_temp_current_char) < CURRENT_MIN_LIMIT)
+    {
+        snprintf(highest_temp_current_char, highest_temp_current_size, "%d", CURRENT_MIN_LIMIT);
+        if(should_log()) printf_with_time("HIGHEST_TEMP_CURRENT的配置值过小，已按%dμA处理", CURRENT_MIN_LIMIT);
+    }
+}
+
+/*
+向“只在启动时写一次”的那些内核节点重新施加参数
+返回真正发生写入的节点个数（内容本来就一致时不会重复写，所以本函数可以随时调用而不会产生副作用）
+*/
+static int apply_kernel_values()
+{
+    int written=0;
+    written += (set_value("/sys/kernel/fast_charge/force_fast_charge", "1") > 0);
+    written += (set_value("/sys/class/power_supply/battery/system_temp_level", "1") > 0);
+    written += (set_value("/sys/class/power_supply/usb/boost_current", "1") > 0);
+    written += (set_value("/sys/class/power_supply/battery/safety_timer_enabled", "0") > 0);
+    written += (set_value("/sys/kernel/fast_charge/failsafe", "1") > 0);
+    written += (set_value("/sys/class/power_supply/battery/allow_hvdcp3", "1") > 0);
+    written += (set_value("/sys/class/power_supply/usb/pd_allowed", "1") > 0);
+    written += (set_value("/sys/class/power_supply/battery/input_current_limited", "0") > 0);
+    written += (set_value("/sys/class/power_supply/battery/input_current_settled", "1") > 0);
+    written += (set_value("/sys/class/qcom-battery/restrict_chg", "0") > 0);
+    return written;
+}
+
 int main()
 {
     char *temp_sensor = NULL,**current_limit_file = NULL,**current_max_file = NULL,**temp_file = NULL;
-    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},thermal[15]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
+    char charge[25]={0},power[10]={0},current_max_char[20]={0},highest_temp_current_char[20]={0},last_appname[FOREGROUND_APP_STRING_MAX_SIZE]={0};
     uchar step_charge=1,power_control=1,force_temp=1,has_force_temp=0,current_change=1,battery_status=1,battery_capacity=1;
     int temp_int=0,current_limit_file_num=0,last_charge_stop=-1,charge_is_stop=0,is_first_time=1,temp_sensor_num=0;
     int current_max_file_num=0,temp_file_num=0,is_bypass=0,can_get_foreground=0,screen_is_off=0,last_temp_max=-1,last_charge_status=0,read_option_time=5;
+    time_t last_reapply_time=0;
     pthread_t thread1 = {0},thread2 = {0};
     //初始化链表
     insert_all_option();
@@ -342,10 +462,16 @@ int main()
     printf("GitHub开源地址：https://github.com/chase535/turbo-charge\n\n");
     //如果是写入文件，则必须加上这句话，不然只能等缓冲区满了后才会一次性写入
     fflush(stdout);
+    //只允许一个实例运行，退出码100代表“已有实例在运行”，守护脚本据此停止重启
+    if(!ensure_single_instance())
+    {
+        printf_with_time("已有另一个实例在运行，本次不再启动");
+        return 100;
+    }
     //判断各个所需文件是否存在
     check_required_files(&battery_status, &battery_capacity, &power_control,
                          &step_charge, &force_temp, &current_change,
-                         &temp_sensor_num, temp_sensor,
+                         &temp_sensor_num, &temp_sensor,
                          &current_max_file, &current_max_file_num,
                          &current_limit_file, &current_limit_file_num,
                          &temp_file, &temp_file_num);
@@ -354,31 +480,35 @@ int main()
     //创建一个子线程用来读取配置文件
     pthread_create(&thread2, NULL, &read_option_file, (void *)&read_option_time);
     pthread_detach(thread2);
-    snprintf(current_max_char, 20, "%d", read_one_option("CURRENT_MAX"));
-    snprintf(highest_temp_current_char, 20, "%d", read_one_option("HIGHEST_TEMP_CURRENT"));
+    load_current_config(current_max_char, 20, highest_temp_current_char, 20);
     printf_with_time("文件检测完毕，程序开始运行");
     //写入初值
-    set_value("/sys/kernel/fast_charge/force_fast_charge", "1");
-    set_value("/sys/class/power_supply/battery/system_temp_level", "1");
-    set_value("/sys/class/power_supply/usb/boost_current", "1");
-    set_value("/sys/class/power_supply/battery/safety_timer_enabled", "0");
-    set_value("/sys/kernel/fast_charge/failsafe", "1");
-    set_value("/sys/class/power_supply/battery/allow_hvdcp3", "1");
-    set_value("/sys/class/power_supply/usb/pd_allowed", "1");
-    set_value("/sys/class/power_supply/battery/input_current_limited", "0");
-    set_value("/sys/class/power_supply/battery/input_current_settled", "1");
-    set_value("/sys/class/qcom-battery/restrict_chg", "0");
+    apply_kernel_values();
+    last_reapply_time=time(NULL);
     set_array_value(current_limit_file, current_limit_file_num, "-1");
     charge_ctl("1");
     //前期工作全部完成，程序正式开始运行
     while(1)
     {
         //读配置文件并赋值给程序内部变量
-        snprintf(current_max_char, 20, "%d", read_one_option("CURRENT_MAX"));
-        snprintf(highest_temp_current_char, 20, "%d", read_one_option("HIGHEST_TEMP_CURRENT"));
+        load_current_config(current_max_char, 20, highest_temp_current_char, 20);
+        //周期性复查那些只在启动时写一次的内核参数，被系统改回时及时补写
+        if(time(NULL) - last_reapply_time >= REAPPLY_INTERVAL)
+        {
+            int written=apply_kernel_values();
+            if(written > 0) printf_with_time("检测到%d项内核参数被系统改回，已重新写入", written);
+            last_reapply_time=time(NULL);
+        }
         //如果无法判断手机的充电状态，则很多功能无法实现，剩余代码很简单
         if(!battery_status)
         {
+            //电量文件存在时仍然按电量进行阶梯充电的判断，旧版本此处从未读取过电量
+            if(battery_capacity && !read_file("/sys/class/power_supply/battery/capacity", power, sizeof(power)))
+            {
+                if(should_log()) printf_with_time("暂时无法读取电池电量，等待下次循环");
+                sleep(read_one_option("CYCLE_TIME"));
+                continue;
+            }
             //阶梯充电
             if(step_charge == 1)
             {
@@ -403,7 +533,12 @@ int main()
         }
         if(force_temp && read_one_option("FORCE_TEMP") == 1 && !has_force_temp) has_force_temp=1;
         //读取手机电量
-        read_file("/sys/class/power_supply/battery/capacity", power, sizeof(power));
+        if(!read_file("/sys/class/power_supply/battery/capacity", power, sizeof(power)))
+        {
+            if(should_log()) printf_with_time("暂时无法读取电池电量，等待下次循环");
+            sleep(read_one_option("CYCLE_TIME"));
+            continue;
+        }
         //阶梯充电，无论是否在充电，都会跟随配置文件进行更改
         if(step_charge == 1)
         {
@@ -412,7 +547,12 @@ int main()
         }
         else if(step_charge == 2) (read_one_option("STEP_CHARGING_DISABLED") == 1)?step_charge_ctl("0"):step_charge_ctl("1");
         //读取充电状态
-        read_file("/sys/class/power_supply/battery/status", charge, sizeof(charge));
+        if(!read_file("/sys/class/power_supply/battery/status", charge, sizeof(charge)))
+        {
+            if(should_log()) printf_with_time("暂时无法读取充电状态，等待下次循环");
+            sleep(read_one_option("CYCLE_TIME"));
+            continue;
+        }
         //如果手机在充电，则根据配置文件进行相应操作
         if(strcmp(charge, "Discharging"))
         {
@@ -439,26 +579,31 @@ int main()
                     continue;
                 }
             }
-            //温度控制功能
-            if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num == 1 && current_change)
+            //温度控制功能，温度读数无效时不做任何动作，避免把异常值当成低温而误恢复大电流
+            if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num && temp_sensor != NULL && current_change)
             {
-                //读取温度传感器所获取的温度值
-                read_file(temp_sensor, thermal, sizeof(thermal));
-                temp_int=atoi(thermal);
+                if(!read_temp(temp_sensor, &temp_int))
+                {
+                    if(should_log()) printf_with_time("暂时无法读取温度传感器的温度值，本轮跳过温度控制");
+                }
                 //如果温度大于等于配置文件所设置的值，则打印相关信息并进入另一个循环中，等待相关事件的发生后退出二层循环
-                if(temp_int >= read_one_option("TEMP_MAX")*1000)
+                else if(temp_int >= read_one_option("TEMP_MAX")*1000)
                 {
                     printf_with_time("手机温度大于等于降低充电电流的温度阈值，限制充电电流为%sμA", highest_temp_current_char);
                     //如果进入了“伪”旁路供电模式则退出此循环
                     while(!is_bypass)
                     {
                         //每次循环重新读取配置文件及温度值
-                        snprintf(current_max_char, 20, "%d", read_one_option("CURRENT_MAX"));
-                        snprintf(highest_temp_current_char, 20, "%d", read_one_option("HIGHEST_TEMP_CURRENT"));
+                        load_current_config(current_max_char, 20, highest_temp_current_char, 20);
                         set_array_value(current_limit_file, current_limit_file_num, "-1");
                         if(force_temp && read_one_option("FORCE_TEMP") == 1 && !has_force_temp) has_force_temp=1;
-                        read_file(temp_sensor, thermal, sizeof(thermal));
-                        temp_int=atoi(thermal);
+                        //读数异常时保持当前的限制状态，不写入任何数值，等待下一次采样
+                        if(!read_temp(temp_sensor, &temp_int))
+                        {
+                            if(should_log()) printf_with_time("暂时无法读取温度传感器的温度值，保持当前充电电流");
+                            sleep(read_one_option("CYCLE_TIME"));
+                            continue;
+                        }
                         //此tmp数组在读取配置文件的函数中，若配置文件的TEMP_MAX发生改变则会得到相应更改
                         //作用是判断新的降低充电电流的温度阈值与旧的温度阈值的大小
                         if(last_temp_max == -1) last_temp_max=read_one_option("TEMP_MAX");
@@ -474,7 +619,7 @@ int main()
                             last_temp_max=read_one_option("TEMP_MAX");
                         }
                         //判断手机充电状态
-                        read_file("/sys/class/power_supply/battery/status", charge, sizeof(charge));
+                        if(!read_file("/sys/class/power_supply/battery/status", charge, sizeof(charge))) charge[0]='\0';
                         if(!strcmp(charge, "Discharging"))
                         {
                             printf_with_time("充电器断开连接，恢复充电电流为%sμA", current_max_char);
@@ -529,10 +674,9 @@ int main()
                 printf_with_time("充电器断开连接");
                 last_charge_status=0;
             }
-            //通过判断全局变量ForegroundAppName是否为空来判断获取前台应用包名的子线程是否在执行
-            //若在执行，则取消此子线程，并清空ForegroundAppName
+            //通过判断子线程是否仍在运行来决定是否需要取消它，若在运行则取消并清空ForegroundAppName
             pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
-            if(strlen((char *)ForegroundAppName))
+            if(strlen((char *)ForegroundAppName) || foreground_thread_alive())
             {
                 pthread_mutex_unlock((pthread_mutex_t *)&mutex_foreground_app);
                 printf_with_time("手机未在充电状态，“伪”旁路供电功能暂时停用");

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "some_ctrl.h"
 #include "options_linkedlist.h"
@@ -11,9 +12,10 @@
 #include "printf_with_time.h"
 
 //阶梯充电的控制，1为开启0为关闭
+//不再在运行时调用check_read_file，节点暂时不存在时由set_value静默跳过，
+//旧版本这里一旦读不到文件就会exit，导致拔插充电器后模块直接消失
 void step_charge_ctl(char *value)
 {
-    check_read_file("/sys/class/power_supply/battery/step_charging_enabled");
     set_value("/sys/class/power_supply/battery/step_charging_enabled", value);
     set_value("/sys/class/power_supply/battery/sw_jeita_enabled", value);
 }
@@ -39,11 +41,11 @@ void charge_ctl(char *i)
 void powel_ctl(int *last_charge_stop, int *charge_is_stop)
 {
     int charge_stop=read_one_option("CHARGE_STOP"),power_int=0;
-    char power[10];
+    char power[10]={0};
     if(*last_charge_stop == -1) *last_charge_stop=charge_stop;
     if(read_one_option("POWER_CTRL") == 1)
     {
-        read_file("/sys/class/power_supply/battery/capacity", power, sizeof(power));
+        if(!read_file("/sys/class/power_supply/battery/capacity", power, sizeof(power))) return;
         power_int=atoi(power);
         if(*last_charge_stop != charge_stop && *charge_is_stop)
         {
@@ -97,26 +99,24 @@ current_max_file_num为电流文件的个数
 */
 void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appname, int *is_bypass, int *screen_is_off, char **current_max_file, int current_max_file_num)
 {
-    char name[APP_PACKAGE_NAME_MAX_SIZE]={0};
+    char name[FOREGROUND_APP_STRING_MAX_SIZE]={0};
     uchar in_list=0;
-    FILE *fp;
+    int i=0,bypass_enabled=read_one_option("BYPASS_CHARGE");
+    FILE *fp=NULL;
     static char **bypass_app_package_name=NULL;
-    static uint bypass_file_last_modify_time=0,bypass_app_num=0;
-    struct stat statbuf;
+    static int bypass_app_num=0;
+    //-1代表“还没读过”，0是合法的修改时间，不能用0做哨兵
+    static time_t bypass_file_last_modify_time=-1;
+    struct stat statbuf={0};
     /*
     为了不使获取前台应用包名拖累主程序的执行效率，所以使用了子线程方案
-    如果配置文件的BYPASS_CHARGE值为1且ForegroundAppName值为空(没有子线程正在执行)，则创建子线程
-    此子线程用来获取前台应用包名
+    如果配置文件的BYPASS_CHARGE值为1且子线程没有在运行，则创建子线程
+    子线程是否在运行由foreground_app.c里的标志位统一维护，不再用占位字符串来判断，
+    否则取消子线程与创建子线程的竞态会导致同时跑出多个子线程，反复fork shell进程拖垮系统
     */
     pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
-    if(read_one_option("BYPASS_CHARGE") == 1 && !strlen((char *)ForegroundAppName))
-    {
-        strncpy((char *)ForegroundAppName, "chase535", APP_PACKAGE_NAME_MAX_SIZE);
-        pthread_create(thread1, NULL, get_foreground_appname, (void *)android_version);
-        pthread_detach(*thread1);
-    }
-    //如果ForegroundAppName值不是初始值，则代表获取到了前台应用包名，则进行匹配并作出相应行动
-    else if(read_one_option("BYPASS_CHARGE") == 1 && strlen((char *)ForegroundAppName) && strcmp((char *)ForegroundAppName, "chase535"))
+    if(bypass_enabled == 1 && !foreground_thread_alive()) start_foreground_appname_thread(thread1, android_version);
+    if(bypass_enabled == 1 && strlen((char *)ForegroundAppName))
     {
         //如果手机从锁屏状态恢复且在锁屏前处于“伪”旁路供电模式，则恢复此模式
         if(strcmp((char *)ForegroundAppName, "screen_is_off"))
@@ -127,29 +127,33 @@ void bypass_charge_ctl(pthread_t *thread1, int *android_version, char *last_appn
                 *screen_is_off=0;
             }
             //读取“伪”旁路供电的配置文件
-            check_read_file(bypass_charge_file);
-            stat(option_file, &statbuf);
-            if(statbuf.st_mtime != bypass_file_last_modify_time)
+            //旧版本这里误用了option_file的修改时间，且从不更新已记录的时间戳，
+            //导致每一轮循环都要重新打开并解析一次配置文件，同时漏掉除第一条以外的所有字符串的内存释放
+            if(check_read_file(bypass_charge_file) && !stat(bypass_charge_file, &statbuf) && statbuf.st_mtime != bypass_file_last_modify_time)
             {
+                bypass_file_last_modify_time=statbuf.st_mtime;
+                //必须先按旧的个数释放，再清零计数
+                free_malloc_memory(&bypass_app_package_name, bypass_app_num);
                 bypass_app_num=0;
-                if(bypass_app_package_name != NULL) free_malloc_memory(&bypass_app_package_name, bypass_app_num);
-                bypass_app_package_name=(char **)my_calloc(1, sizeof(char *));
                 fp=fopen(bypass_charge_file, "rt");
-                while(fgets(name, sizeof(name), fp) != NULL)
+                if(fp != NULL)
                 {
-                    line_feed(name);
-                    //跳过以英文井号开头的行及空行
-                    if((strlen(name) == 0) || (name[0] == '#')) continue;
-                    bypass_app_num++;
-                    bypass_app_package_name=(char **)my_realloc(bypass_app_package_name, sizeof(char *)*bypass_app_num);
-                    bypass_app_package_name[bypass_app_num-1]=(char *)my_calloc(1, sizeof(char)*FOREGROUND_APP_STRING_MAX_SIZE);
-                    strncpy(bypass_app_package_name[bypass_app_num-1], name, APP_PACKAGE_NAME_MAX_SIZE);
+                    while(fgets(name, sizeof(name), fp) != NULL)
+                    {
+                        line_feed(name);
+                        //跳过以英文井号开头的行及空行
+                        if((strlen(name) == 0) || (name[0] == '#')) continue;
+                        bypass_app_num++;
+                        bypass_app_package_name=(char **)my_realloc(bypass_app_package_name, sizeof(char *)*bypass_app_num);
+                        bypass_app_package_name[bypass_app_num-1]=(char *)my_calloc(1, sizeof(char)*FOREGROUND_APP_STRING_MAX_SIZE);
+                        strncpy(bypass_app_package_name[bypass_app_num-1], name, APP_PACKAGE_NAME_MAX_SIZE-1);
+                    }
+                    fclose(fp);
+                    fp=NULL;
                 }
-                fclose(fp);
-                fp=NULL;
             }
             //判断前台应用包名是否在配置文件中
-            for(uint i=0;i < bypass_app_num; i++)
+            for(i=0;i < bypass_app_num && bypass_app_package_name != NULL;i++)
             {
                 if(!strcmp((char *)ForegroundAppName, bypass_app_package_name[i]))
                 {
