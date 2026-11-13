@@ -163,11 +163,19 @@ on_install()
         _old_ftm=$(grep "^FORCE_TEMP_MAX=" /data/adb/turbo-charge/option.txt | sed "s/^FORCE_TEMP_MAX=//g")
         if [[ -n "${_old_ftm}" ]] && echo "${_old_ftm}" | grep -q '^[0-9][0-9]*$'; then
             if [[ "${_old_ftm}" -lt 47 ]]; then
-                ui_print "  - 旧的FORCE_TEMP_MAX=${_old_ftm}℃偏低（充电常态温度就在45~47℃），已改用新的48℃"
+                ui_print "  - 旧的FORCE_TEMP_MAX=${_old_ftm}℃偏低（充电常态温度就在45~47℃），已改用新的49℃"
             else
                 ui_print "  - 旧的FORCE_TEMP_MAX=${_old_ftm}℃保留"
                 sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=${_old_ftm}/g" ${TMPDIR}/option.txt
             fi
+        fi
+        # 上一版(v74)的默认组合是 熔断48/解除45/限流4A。
+        # 实测该组合仍会在47.9℃触发熔断，把34W打到16.6W；v75把三值一起改为 49/46/6A。
+        # 只在三项"完全等于上一版默认"时才整体升级，避免覆盖用户自己调过的值
+        _old_gr=$(grep "^GUARD_RECOVER=" /data/adb/turbo-charge/option.txt | sed "s/^GUARD_RECOVER=//g")
+        if [[ "${_old_ftm}" == "48" && "${_old_gr}" == "45" && "${_old_htc}" == "4000000" ]]; then
+            sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=49/g; s/^GUARD_RECOVER=.*/GUARD_RECOVER=46/g; s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=6000000/g" ${TMPDIR}/option.txt
+            ui_print "  - 检测到上一版的默认温度策略（48℃/45℃/4A），已整体升级为49℃/46℃/6A"
         fi
     else
         ui_print " 旧配置文件不存在，使用默认配置"

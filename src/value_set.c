@@ -128,7 +128,7 @@ tempwall为是否启用超过一定温度时强制向温度文件写入28℃
 void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar tempwall)
 {
     char thermal[15]={0},bat_temp[8]={0};
-    int raw_temp=0,temp_int=0;
+    int raw_temp=0,temp_int=0,i=0;
     if(temp_sensor == NULL) return;
     //读取温度文件
     if(!read_file(temp_sensor, thermal, sizeof(thermal))) return;
@@ -144,19 +144,23 @@ void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar temp
     if(raw_temp < 2000) temp_int=raw_temp/10;
     else temp_int=raw_temp/1000;
     snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int*10);
-    //如果tempwall为1，则判断温度是否超过指定值，若超过则显示真实温度（交给系统自己的温控），否则显示28℃
-    //如果tempwall为0，则永远显示正常温度
     /*
-    阈值以前是写死的45℃，现在改为读取配置FORCE_TEMP_MAX：
-    电池温度被长期伪造成28℃后，系统自身的JEITA保护完全失效，
-    用户在看到"28.0℃"的同时真实温度可能已经四十多度，
-    所以超过阈值时必须把真实温度交还给系统，不能继续骗下去
+    只伪装系统JEITA真正读取的 battery/temp，其余温度节点一律不动
+    /sys/class/power_supply 下同时存在 bms/temp、cp_master/temp、mtk-master-charger/temp 等多个温度节点，
+    旧版本把它们全部写成28℃，后果是系统自己的过温保护被绕过之后，
+    连"真实电池温度是多少"都再没有任何地方能读到 —— 一旦散热出问题，日志里也看不出来。
+    现在保留 bms/temp 等节点的真实读数，作为独立观测通道（charge_log 的 tbat_raw 列就是它）
     */
-    if(tempwall)
+    for(i=0;i < temp_file_num;i++)
     {
-        int threshold=read_one_option("FORCE_TEMP_MAX");
-        if(threshold < 35) threshold=35;
-        (temp_int >= threshold)?set_array_value(temp_file, temp_file_num, bat_temp):set_array_value(temp_file, temp_file_num, "280");
+        if(temp_file[i] == NULL) continue;
+        if(strstr(temp_file[i], "/battery/") == NULL) continue;
+        if(tempwall)
+        {
+            int threshold=read_one_option("FORCE_TEMP_MAX");
+            if(threshold < 35) threshold=35;
+            set_value(temp_file[i], (temp_int >= threshold)?bat_temp:"280");
+        }
+        else set_value(temp_file[i], bat_temp);
     }
-    else set_array_value(temp_file, temp_file_num, bat_temp);
 }

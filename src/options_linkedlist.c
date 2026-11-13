@@ -37,7 +37,7 @@ void insert_all_option()
     insert_option("CHARGE_STOP", 95);
     insert_option("CHARGE_START", 80);
     insert_option("TEMP_MAX", 52);
-    insert_option("HIGHEST_TEMP_CURRENT", 2000000);
+    insert_option("HIGHEST_TEMP_CURRENT", 6000000);
     insert_option("RECHARGE_TEMP", 45);
     insert_option("BYPASS_CHARGE", 0);
     //智能分段充电：按电量分档限制电流，让降速发生在高电量段
@@ -47,9 +47,9 @@ void insert_all_option()
     //智能分段模式下的满速基准电流（单位:μA），8000000=8A
     insert_option("PEAK_CURRENT", 8000000);
     //真实温度熔断阈值（单位:℃），用温度传感器原始读数判断，不受强制显示28℃影响
-    insert_option("FORCE_TEMP_MAX", 45);
+    insert_option("FORCE_TEMP_MAX", 49);
     //熔断解除阈值（单位:℃），必须低于FORCE_TEMP_MAX才有滞回，否则温度抖1℃就反复开关熔断
-    insert_option("GUARD_RECOVER", 42);
+    insert_option("GUARD_RECOVER", 46);
 }
 
 //读取单个配置的值

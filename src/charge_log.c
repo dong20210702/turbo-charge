@@ -200,7 +200,7 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
         {
             fputs("time,cap_pct,status,chg_type,health,"
                   "vbat_v,ibat_a,pbat_w,"
-                  "tbat_c,tsensor_c,"
+                  "tbat_c,tbat_raw,tsensor_c,"
                   "vusb_v,iusb_a,usb_online,vbus_max_v,ibus_max_a,"
                   "ccc_max_a,ccc_a,icl_limited,icl_a,vin_v,"
                   "chg_full_mah,chg_design_mah,cycles,"
@@ -245,8 +245,17 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     else fputs("NA", log_fp);
     fputc(',', log_fp);
 
-    //电池温度：这一列在本模块启用FORCE_TEMP后会被伪造成28.0，只能当参考
+    //电池温度：这一列在本模块启用FORCE_TEMP后会一直是28.0（伪装生效的标志），要看真值请用下一列
     put_scaled(log_fp, "/sys/class/power_supply/battery/temp", 10.0, 1);
+    fputc(',', log_fp);
+
+    /*
+    真实电池温度：bms上报的独立温度，本模块不再改写它
+    上一版把 /sys/class/power_supply 下所有 temp 节点全部写成28℃，
+    结果是伪装生效之后，整台机器上再没有任何一个地方能读到真实电池温度，
+    等于用"看不见过热"换来了充电速度。这一列就是补回来的观测通道
+    */
+    put_scaled(log_fp, "/sys/class/power_supply/bms/temp", 10.0, 1);
     fputc(',', log_fp);
 
     //温度传感器的原始读数(thermal_zone，单位0.001℃)：这一列才是真实温度，模块不会改写它
