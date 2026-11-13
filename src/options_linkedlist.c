@@ -48,6 +48,8 @@ void insert_all_option()
     insert_option("PEAK_CURRENT", 8000000);
     //真实温度熔断阈值（单位:℃），用温度传感器原始读数判断，不受强制显示28℃影响
     insert_option("FORCE_TEMP_MAX", 45);
+    //熔断解除阈值（单位:℃），必须低于FORCE_TEMP_MAX才有滞回，否则温度抖1℃就反复开关熔断
+    insert_option("GUARD_RECOVER", 42);
 }
 
 //读取单个配置的值

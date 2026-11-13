@@ -87,6 +87,65 @@ static void put_text(FILE *fp, const char *path)
     fputs(buf, fp);
 }
 
+/*
+探测输入限流(ICL)与输入电压节点
+这两项是判断"功率天花板在哪"的核心：
+  icl_a   内核此刻真正允许的输入电流。模块写进去的是8A，但MTK的AICL会按
+          充电器/线材实际能力把它压回去，压到多少只有读这个节点才知道
+  vin_v   充电器实际协商到的电压。9V档×3A=27W，正好卡在用户抱怨的"峰值30W上不去"
+机型不同节点名不同，所以按候选表逐个试，第一次探测成功后缓存路径，避免每5秒扫一遍
+*/
+static const char *icl_candidates[]={
+    "/sys/class/power_supply/mtk-master-charger/input_current_limit",
+    "/sys/class/power_supply/battery/input_current_limit",
+    "/sys/class/power_supply/usb/input_current_limit",
+    "/sys/class/power_supply/charger/input_current_limit",
+    NULL
+};
+static const char *vin_candidates[]={
+    "/sys/class/power_supply/mtk-master-charger/voltage_now",
+    "/sys/class/power_supply/charger/voltage_now",
+    "/sys/class/power_supply/usb/voltage_now",
+    NULL
+};
+static const char *icl_path = NULL;
+static const char *vin_path = NULL;
+
+static const char *pick_current_node(const char **candidates, long min_value)
+{
+    long value=0;
+    int i=0;
+    for(i=0;candidates[i];i++)
+    {
+        if(read_long(candidates[i], &value) && value >= min_value) return candidates[i];
+    }
+    return NULL;
+}
+
+//输入电流，单位可能是μA也可能是mA，按量级判定后统一换算成A
+static void put_icl(FILE *fp)
+{
+    long value=0;
+    char buf[32]={0};
+    if(icl_path == NULL) icl_path=pick_current_node(icl_candidates, 1000);
+    if(icl_path == NULL) { fputs("NA", fp); return; }
+    if(!raw_read(icl_path, buf, sizeof(buf))) { icl_path=NULL; fputs("NA", fp); return; }
+    value=strtol(buf, NULL, 10);
+    if(value <= 0) { fputs("NA", fp); return; }
+    //<=30000 只可能是mA制（30A以上的μA值不现实），其余按μA处理
+    if(value <= 30000) fprintf(fp, "%.3f", (double)value/1000.0);
+    else fprintf(fp, "%.3f", (double)value/1e6);
+}
+
+static void put_vin(FILE *fp)
+{
+    long value=0;
+    if(vin_path == NULL) vin_path=pick_current_node(vin_candidates, 1000000);
+    if(vin_path == NULL) { fputs("NA", fp); return; }
+    if(!read_long(vin_path, &value) || value <= 0) { vin_path=NULL; fputs("NA", fp); return; }
+    fprintf(fp, "%.2f", (double)value/1e6);
+}
+
 void charge_log_init(void)
 {
     log_fp=NULL;
@@ -143,7 +202,7 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
                   "vbat_v,ibat_a,pbat_w,"
                   "tbat_c,tsensor_c,"
                   "vusb_v,iusb_a,usb_online,vbus_max_v,ibus_max_a,"
-                  "ccc_max_a,ccc_a,icl_limited,"
+                  "ccc_max_a,ccc_a,icl_limited,icl_a,vin_v,"
                   "chg_full_mah,chg_design_mah,cycles,"
                   "tcpu_c,"
                   "applied_a,stage\n", log_fp);
@@ -218,6 +277,11 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     put_scaled_abs(log_fp, "/sys/class/power_supply/battery/constant_charge_current", 1e6, 3);
     fputc(',', log_fp);
     put_long(log_fp, "/sys/class/power_supply/battery/input_current_limited");
+    fputc(',', log_fp);
+    //输入限流实际生效值(A)与输入电压(V)：写进去的电流和真正生效的电流往往不是一回事
+    put_icl(log_fp);
+    fputc(',', log_fp);
+    put_vin(log_fp);
     fputc(',', log_fp);
 
     //电池健康度：满充容量相对设计容量的比值决定了恒压阶段会提前多久到来

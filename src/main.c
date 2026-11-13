@@ -156,6 +156,15 @@ static int ensure_single_instance()
 
 //读取温度传感器的温度值，成功返回1，读数无效返回0
 //0、1、-1是内核在节点不可用时返回的占位值，必须按无效处理，否则会被当成“温度已经降到0度”而误恢复大电流
+/*
+读取温度传感器的原始值，统一换算成 0.001℃ 返回
+thermal_zone 下的 temp 单位是 0.001℃（45000 = 45.0℃），
+power_supply 下的 temp 单位是 0.1℃（450 = 45.0℃），两者差 10 倍，
+旧版本一律按 0.001℃ 处理，一旦温度源换到 power_supply 就会把 45℃ 读成 4.5℃，
+温度保护等于直接失效。这里按量级判定单位：
+  raw < 2000  → 0.1℃ 制（最大对应 200℃，真实机型不会超过），乘 10 后返回
+  raw >= 2000 → 已是 0.001℃ 制，原样返回
+*/
 static int read_temp(char *temp_sensor, int *temp_int)
 {
     char thermal[15]={0};
@@ -164,6 +173,7 @@ static int read_temp(char *temp_sensor, int *temp_int)
     if(!read_file(temp_sensor, thermal, sizeof(thermal))) return 0;
     value=atoi(thermal);
     if(value <= 1 || value > 200000) return 0;
+    if(value < 2000) value*=10;
     *temp_int=value;
     return 1;
 }
@@ -554,6 +564,8 @@ int main()
     int *current_max_unit=NULL;
     int current_max_file_num=0,temp_file_num=0,is_bypass=0,can_get_foreground=0,screen_is_off=0,last_temp_max=-1,last_charge_status=0,read_option_time=5;
     int applied_current=0,full_handled=0;
+    //温度熔断锁存状态：1=当前处于熔断降流，0=正常分段。跨轮次保留，用来实现滞回
+    static int guard_latched=0;
     time_t last_reapply_time=0;
     pthread_t thread1 = {0},thread2 = {0};
     //初始化链表
@@ -593,6 +605,20 @@ int main()
     if(read_one_option("SMART_CHARGE") == 1 && read_one_option("STEP_CHARGING_DISABLED") != 1)
         printf_with_time("提示：智能分段充电已启用，但阶梯式充电仍处于开启状态，系统会在电量过半后自行降流，建议把option.txt中的STEP_CHARGING_DISABLED改为1");
     printf_with_time("充电采样日志：/data/adb/turbo-charge/charge_log.csv（充电中每5秒一行）");
+    /*
+    启动时把当前生效的温控策略打印出来
+    温度相关的三个阈值互相牵制，光看option.txt很容易配出"阈值低于环境常态"这种组合，
+    结果就是充电全程都在熔断降流里跑，日志里只看得到一个很低的平均功率，很难定位
+    */
+    {
+        int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
+        int gap=guard_on_show-guard_off_show;
+        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 温控%d℃进%d℃出",
+                         guard_on_show, guard_off_show, read_one_option("HIGHEST_TEMP_CURRENT"),
+                         read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
+        if(gap < 2) printf_with_time("警告：熔断阈值与解除阈值只差%d℃，等于没有滞回，温度抖动会导致大电流和小电流每秒来回切，建议拉开3℃以上", gap);
+        if(guard_on_show <= 46) printf_with_time("警告：熔断阈值%d℃偏低，多数机型充电时的常态温度就在45~47℃，阈值压在这个区间会让充电大部分时间处于限流状态", guard_on_show);
+    }
     printf_with_time("文件检测完毕，程序开始运行");
     //写入初值
     apply_kernel_values();
@@ -813,11 +839,41 @@ int main()
             if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num && temp_sensor != NULL)
             {
                 int real_temp=0;
-                if(read_temp(temp_sensor, &real_temp) && real_temp >= read_one_option("FORCE_TEMP_MAX")*1000)
+                if(read_temp(temp_sensor, &real_temp))
                 {
+                    /*
+                    熔断必须带滞回（进/出用两个不同阈值）
+                    旧版本进和出都用 FORCE_TEMP_MAX 一个值，温度在阈值上下来回抖1℃就会
+                    反复开关熔断：一进熔断写2A、系统跟着降流，温度掉下去又放开8A，
+                    平均下来功率比一直熔断还低。这里改成
+                      >= FORCE_TEMP_MAX  → 进入熔断
+                      <= GUARD_RECOVER    → 解除熔断
+                    中间区间保持上一次的状态，不来回切
+                    */
+                    int guard_on=read_one_option("FORCE_TEMP_MAX");
+                    int guard_off=read_one_option("GUARD_RECOVER");
+                    int was_latched=guard_latched;
+                    if(guard_on < 35) guard_on=35;
+                    //配置写反或没留间隔时强制留出3℃滞回，否则等于没有滞回
+                    if(guard_off >= guard_on-1) guard_off=guard_on-3;
+                    if(guard_off < 30) guard_off=30;
+                    if(real_temp >= guard_on*1000) guard_latched=1;
+                    else if(real_temp <= guard_off*1000) guard_latched=0;
+                    if(guard_latched)
+                    {
+                        applied_current=atoi(highest_temp_current_char);
+                        snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
+                        if(!was_latched) printf_with_time("温度%.1f℃达到熔断阈值%d℃，电流限制为%dμA（降到%d℃以下才解除）", (double)real_temp/1000.0, guard_on, applied_current, guard_off);
+                        else if(should_log()) printf_with_time("温度%.1f℃仍在熔断区间（%d~%d℃），电流保持%dμA", (double)real_temp/1000.0, guard_off, guard_on, applied_current);
+                    }
+                    else if(was_latched) printf_with_time("温度%.1f℃已降到恢复阈值%d℃以下，解除熔断，恢复分段电流%dμA", (double)real_temp/1000.0, guard_off, applied_current);
+                }
+                else if(guard_latched)
+                {
+                    //读不到温度时沿用上一次的熔断状态，绝不因为"读不到"就放开大电流
                     applied_current=atoi(highest_temp_current_char);
                     snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
-                    if(should_log()) printf_with_time("温度传感器原始读数为%.1f℃，已达安全阈值，电流限制为%dμA", (double)real_temp/1000.0, applied_current);
+                    if(should_log()) printf_with_time("暂时无法读取温度，保持熔断状态，电流%dμA", applied_current);
                 }
             }
             //向电流文件中写入本轮允许的最大充电电流

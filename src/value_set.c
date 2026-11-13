@@ -135,10 +135,15 @@ void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar temp
     raw_temp=atoi(thermal);
     //0、1、-1是节点不可用时的占位值，直接丢弃，避免把“读不到温度”当成“温度很低”
     if(raw_temp <= 1) return;
-    //thermal_zone的temp单位是0.001℃，power_supply的temp单位是0.1℃，直接除以100取整
-    //旧版本用snprintf截断字符串来换算，温度低于10℃或为负数时会被算错（9.5℃→95℃、-5℃→-50℃）
-    temp_int=raw_temp/100;
-    snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int);
+    /*
+    温度源可能是 thermal_zone（0.001℃）也可能是 power_supply（0.1℃），按量级判定：
+    raw < 2000 视为 0.1℃ 制，否则视为 0.001℃ 制。
+    temp_int 统一换算成整摄氏度用于阈值比较，bat_temp 一律按 0.1℃ 制写回
+    （power_supply 的 temp 节点就是 0.1℃，写 280 表示 28.0℃）
+    */
+    if(raw_temp < 2000) temp_int=raw_temp/10;
+    else temp_int=raw_temp/1000;
+    snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int*10);
     //如果tempwall为1，则判断温度是否超过指定值，若超过则显示真实温度（交给系统自己的温控），否则显示28℃
     //如果tempwall为0，则永远显示正常温度
     /*
