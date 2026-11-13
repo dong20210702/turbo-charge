@@ -109,7 +109,7 @@ print_info()
     ui_print " -      ↓模块介绍↓"
     ui_print " - 删除温控，充电时持续修改电池温度，让系统认为电池温度一直是28℃"
     ui_print " - 持续修改充电电流，以达到最快充电速度"
-    ui_print " - 可选添加温控，若添加，默认当手机温度高于52℃时最高充电电流限制为4A"
+    ui_print " - 可选添加温控，若添加，默认当手机温度高于58℃时最高充电电流限制为6A"
     ui_print " - 可选添加电量控制，若添加，默认电量到达95%时断电，小于等于80%时恢复充电"
     ui_print " - 可选是否关闭阶梯式充电，若选是，默认电量大于15%时关闭阶梯式充电，电量小于等于15%时开启阶梯式充电"
     ui_print " - 可选是否启用“伪”旁路充电，但请注意是“伪”，因为并不是真的旁路供电，而是直接将充电电流降低至500mA"
@@ -177,9 +177,22 @@ on_install()
             sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=49/g; s/^GUARD_RECOVER=.*/GUARD_RECOVER=46/g; s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=6000000/g" ${TMPDIR}/option.txt
             ui_print "  - 检测到上一版的默认温度策略（48℃/45℃/4A），已整体升级为49℃/46℃/6A"
         fi
+        # v76：旧默认 TEMP_MAX=52 会被满速充电时的主板温度（实测峰值54.4℃）长期触发，
+        # 把功率压在26W并且几乎出不来；RECHARGE_TEMP=45 永远达不到，等于进了出不去。
+        # 只对等于旧默认的值做升级，用户自己调过的保持不动
+        _old_tmx=$(grep "^TEMP_MAX=" /data/adb/turbo-charge/option.txt | sed "s/^TEMP_MAX=//g")
+        _old_rt=$(grep "^RECHARGE_TEMP=" /data/adb/turbo-charge/option.txt | sed "s/^RECHARGE_TEMP=//g")
+        if [[ "${_old_tmx}" == "52" ]]; then
+            sed -i "s/^TEMP_MAX=.*/TEMP_MAX=58/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的TEMP_MAX=52℃会被满速充电的主板温度长期触发，已更新为58℃"
+        fi
+        if [[ "${_old_rt}" == "45" ]]; then
+            sed -i "s/^RECHARGE_TEMP=.*/RECHARGE_TEMP=50/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的RECHARGE_TEMP=45℃低于限流后的稳定温度，等于进得去出不来，已更新为50℃"
+        fi
     else
         ui_print " 旧配置文件不存在，使用默认配置"
-        ui_print "  - 添加温控，当温度高于52℃时限制最高充电电流为4A，低于45℃时恢复"
+        ui_print "  - 添加温控，当温度高于58℃时限制最高充电电流为6A，低于50℃时恢复"
         ui_print "  - 不添加电量控制"
         ui_print "  - 不关闭阶梯式充电"
         ui_print "  - 启用强制显示28℃功能"

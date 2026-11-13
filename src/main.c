@@ -618,6 +618,14 @@ int main()
                          read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
         if(gap < 2) printf_with_time("警告：熔断阈值与解除阈值只差%d℃，等于没有滞回，温度抖动会导致大电流和小电流每秒来回切，建议拉开3℃以上", gap);
         if(guard_on_show <= 46) printf_with_time("警告：熔断阈值%d℃偏低，多数机型充电时的常态温度就在45~47℃，阈值压在这个区间会让充电大部分时间处于限流状态", guard_on_show);
+        /*
+        熔断判断和日志观测用的都是电池自身的温度，不是手机温度传感器
+        手机温度传感器（wifi_therm等）在满速充电叠加重负载时能到54℃，
+        而电池可能只有47℃，拿它当电池温度判断会在电池并不热的时候误降流
+        */
+        const char *bzone=battery_zone_path();
+        if(bzone != NULL) printf_with_time("电池真实温度观测通道：%s", (char *)bzone);
+        else printf_with_time("警告：thermal子系统中找不到电池温度传感器，真实温度只能退回bms/temp，而它会被本模块伪装成28℃，日志tbat_raw列将失去参考价值");
     }
     printf_with_time("文件检测完毕，程序开始运行");
     //写入初值
@@ -839,7 +847,18 @@ int main()
             if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num && temp_sensor != NULL)
             {
                 int real_temp=0;
-                if(read_temp(temp_sensor, &real_temp))
+                /*
+                熔断判断用电池自身的温度，而不是手机温度传感器
+                实测wifi_therm（主板/WiFi区）在满速充电叠加重负载时能到54.4℃，
+                同期电池只有47~48℃。拿主板温度当电池温度判断，会在电池并不热的时候
+                误触发熔断，白白把功率压下去。thermal子系统的电池传感器模块不写，
+                伪装成28℃之后仍然读得到真值，所以优先用它，读不到再退回手机温度传感器
+                */
+                int real_tenth=0;
+                int have_bat_temp=read_battery_real_temp(&real_tenth);
+                if(have_bat_temp) real_temp=real_tenth*10;
+                else if(!read_temp(temp_sensor, &real_temp)) real_temp=0;
+                if(real_temp > 0)
                 {
                     /*
                     熔断必须带滞回（进/出用两个不同阈值）
@@ -863,10 +882,10 @@ int main()
                     {
                         applied_current=atoi(highest_temp_current_char);
                         snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
-                        if(!was_latched) printf_with_time("温度%.1f℃达到熔断阈值%d℃，电流限制为%dμA（降到%d℃以下才解除）", (double)real_temp/1000.0, guard_on, applied_current, guard_off);
-                        else if(should_log()) printf_with_time("温度%.1f℃仍在熔断区间（%d~%d℃），电流保持%dμA", (double)real_temp/1000.0, guard_off, guard_on, applied_current);
+                        if(!was_latched) printf_with_time("电池温度%.1f℃达到熔断阈值%d℃，电流限制为%dμA（降到%d℃以下才解除）", (double)real_temp/1000.0, guard_on, applied_current, guard_off);
+                        else if(should_log()) printf_with_time("电池温度%.1f℃仍在熔断区间（%d~%d℃），电流保持%dμA", (double)real_temp/1000.0, guard_off, guard_on, applied_current);
                     }
-                    else if(was_latched) printf_with_time("温度%.1f℃已降到恢复阈值%d℃以下，解除熔断，恢复分段电流%dμA", (double)real_temp/1000.0, guard_off, applied_current);
+                    else if(was_latched) printf_with_time("电池温度%.1f℃已降到恢复阈值%d℃以下，解除熔断，恢复分段电流%dμA", (double)real_temp/1000.0, guard_off, applied_current);
                 }
                 else if(guard_latched)
                 {

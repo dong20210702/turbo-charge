@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 #include "charge_log.h"
+#include "value_set.h"
 #include "printf_with_time.h"
 
 #define CHARGE_LOG_FILE      "/data/adb/turbo-charge/charge_log.csv"
@@ -250,12 +251,18 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     fputc(',', log_fp);
 
     /*
-    真实电池温度：bms上报的独立温度，本模块不再改写它
-    上一版把 /sys/class/power_supply 下所有 temp 节点全部写成28℃，
-    结果是伪装生效之后，整台机器上再没有任何一个地方能读到真实电池温度，
-    等于用"看不见过热"换来了充电速度。这一列就是补回来的观测通道
+    真实电池温度：取自thermal子系统的电池传感器（MTK为mtktsbtsnrpa/mtktsbtsmdpa），
+    这个节点本模块从不写入，所以伪装生效后仍然读得到真值；
+    只有在thermal里找不到电池传感器时才退回bms/temp，而bms/temp此时已被伪造成28.0，
+    那一列的参考价值就没了 —— 启动日志会打印实际用的是哪一个
+    v75曾经只伪装battery/temp、把bms/temp留给真值，结果bms驱动立刻覆盖battery/temp，
+    伪装整体失效（实测电池47℃时系统把充电器反复切断，59分钟电量纹丝不动）
     */
-    put_scaled(log_fp, "/sys/class/power_supply/bms/temp", 10.0, 1);
+    {
+        int real_tenth=0;
+        if(read_battery_real_temp(&real_tenth)) fprintf(log_fp, "%.1f", real_tenth/10.0);
+        else fputs("NA", log_fp);
+    }
     fputc(',', log_fp);
 
     //温度传感器的原始读数(thermal_zone，单位0.001℃)：这一列才是真实温度，模块不会改写它

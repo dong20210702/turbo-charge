@@ -4,8 +4,80 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include "value_set.h"
+
+/*
+真实电池温度的独立观测通道
+
+为什么需要它：
+模块会把 /sys/class/power_supply 下的温度节点全部伪造成28℃，让系统JEITA不再降流，
+但这样一来整台机器上就没有任何地方能读到电池到底多热了 —— 出问题时无法判断是否真的过热。
+thermal子系统（/sys/class/thermal）下的传感器本模块从不写入，且MTK平台会暴露
+mtktsbtsnrpa / mtktsbtsmdpa 这类电池温度传感器（BTS = battery sensor），
+伪装生效后仍然读得到真值，正好用来做熔断判断和日志观测。
+*/
+static char bat_zone_temp_path[160]={0};
+static int bat_zone_checked=0;
+
+static void probe_battery_zone(void)
+{
+    DIR *dir=NULL;
+    struct dirent *ent=NULL;
+    char type_path[192]={0},type[64]={0};
+    bat_zone_checked=1;
+    dir=opendir("/sys/class/thermal");
+    if(dir == NULL) return;
+    while((ent=readdir(dir)) != NULL)
+    {
+        if(strncmp(ent->d_name, "thermal_zone", 12) != 0) continue;
+        snprintf(type_path, sizeof(type_path), "/sys/class/thermal/%s/type", ent->d_name);
+        type[0]='\0';
+        if(!read_file(type_path, type, sizeof(type))) continue;
+        if(strstr(type, "bts") == NULL && strstr(type, "battery") == NULL) continue;
+        snprintf(bat_zone_temp_path, sizeof(bat_zone_temp_path), "/sys/class/thermal/%s/temp", ent->d_name);
+        break;
+    }
+    closedir(dir);
+}
+
+/*
+读取真实电池温度，返回1成功、0失败；*tenth_c 为0.1℃制（47.2℃ → 472）
+优先thermal子系统的电池传感器，读不到再退回bms/temp
+*/
+int read_battery_real_temp(int *tenth_c)
+{
+    char buf[32]={0};
+    int raw=0;
+    if(tenth_c == NULL) return 0;
+    if(!bat_zone_checked) probe_battery_zone();
+    if(bat_zone_temp_path[0] != '\0')
+    {
+        buf[0]='\0';
+        if(read_file(bat_zone_temp_path, buf, sizeof(buf)))
+        {
+            raw=atoi(buf);
+            //thermal_zone的temp是0.001℃制
+            if(raw > 1 && raw < 200000) { *tenth_c=raw/100; return 1; }
+        }
+    }
+    //兜底：bms/temp本身是0.1℃制
+    buf[0]='\0';
+    if(read_file("/sys/class/power_supply/bms/temp", buf, sizeof(buf)))
+    {
+        raw=atoi(buf);
+        if(raw > 1 && raw < 2000) { *tenth_c=raw; return 1; }
+    }
+    return 0;
+}
+
+//供启动日志打印，返回探测到的电池温度传感器节点路径，未找到返回NULL
+const char *battery_zone_path(void)
+{
+    if(!bat_zone_checked) probe_battery_zone();
+    return (bat_zone_temp_path[0] != '\0')?bat_zone_temp_path:NULL;
+}
 
 /*
 向文件写入数据，返回1代表发生了写入，0代表内容本来就一致（未写入），-1代表写入失败或文件不存在
@@ -145,22 +217,35 @@ void set_temp(char *temp_sensor, char **temp_file, int temp_file_num, uchar temp
     else temp_int=raw_temp/1000;
     snprintf(bat_temp, sizeof(bat_temp), "%d", temp_int*10);
     /*
-    只伪装系统JEITA真正读取的 battery/temp，其余温度节点一律不动
-    /sys/class/power_supply 下同时存在 bms/temp、cp_master/temp、mtk-master-charger/temp 等多个温度节点，
-    旧版本把它们全部写成28℃，后果是系统自己的过温保护被绕过之后，
-    连"真实电池温度是多少"都再没有任何地方能读到 —— 一旦散热出问题，日志里也看不出来。
-    现在保留 bms/temp 等节点的真实读数，作为独立观测通道（charge_log 的 tbat_raw 列就是它）
+    熔断判断必须用电池自身的温度，不能用手机温度传感器
+    v75实测问题：wifi_therm（主板/WiFi区）在满速充电+重负载时会爬到54.4℃，
+    而电池实际只有47~48℃。用wifi_therm和FORCE_TEMP_MAX比较，会在电池并不热的时候
+    就把真实温度交还给系统，系统看到50℃以上立刻对充电器做开/关硬切断，
+    表现为电量卡死不动（实测59分钟只从38%涨到48%，之后一小时零增长）。
+    这里改用thermal子系统的电池传感器（模块不写，伪装后仍读得到真值）判断。
+    */
+    int real_tenth=0;
+    int have_real=read_battery_real_temp(&real_tenth);
+    int guard=0,handover=0;
+    if(tempwall)
+    {
+        int threshold=read_one_option("FORCE_TEMP_MAX");
+        if(threshold < 35) threshold=35;
+        //有真实电池温度时按真实值判断，读不到才退回用手机温度传感器
+        guard=have_real?(real_tenth >= threshold*10):(temp_int >= threshold);
+        //默认不把真实温度交还系统
+        handover=read_one_option("GUARD_HANDOVER");
+    }
+    /*
+    伪装必须写遍 /sys/class/power_supply 下所有temp节点，不能只写 battery/temp
+    v75实测问题：只写battery/temp时，bms驱动会立刻把真值写回这个节点（它是bms的镜像），
+    伪装完全失效，系统JEITA照常按47℃把充电器切断。
+    代价是这些节点上再读不到真值 —— 所以真实温度观测改由 read_battery_real_temp() 承担。
     */
     for(i=0;i < temp_file_num;i++)
     {
         if(temp_file[i] == NULL) continue;
-        if(strstr(temp_file[i], "/battery/") == NULL) continue;
-        if(tempwall)
-        {
-            int threshold=read_one_option("FORCE_TEMP_MAX");
-            if(threshold < 35) threshold=35;
-            set_value(temp_file[i], (temp_int >= threshold)?bat_temp:"280");
-        }
+        if(tempwall) set_value(temp_file[i], (guard && handover)?bat_temp:"280");
         else set_value(temp_file[i], bat_temp);
     }
 }
