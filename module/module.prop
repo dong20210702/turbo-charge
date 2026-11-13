@@ -1,7 +1,7 @@
 id=turbo-charge
 name=充电加速
-version=v73
-versionCode=73
+version=v74
+versionCode=74
 author=酷安@诺鸡鸭
 description=删除温控，关闭阶梯式充电，持续修改电池温度及充电电流，尽可能的让手机满血快充。配置文件在/data/adb/turbo-charge/option.txt，可以更改一些参数，日志文件为同目录的log.txt，充电采样数据在同目录的charge_log.csv；若日志提示电流功能失效，同目录的probe.txt记录了本机全部可写节点
 updateJson=https://cdn.jsdelivr.net/gh/dong20210702/turbo-charge@main/update_channel/turbo-charge.json

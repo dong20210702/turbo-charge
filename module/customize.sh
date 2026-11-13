@@ -109,7 +109,7 @@ print_info()
     ui_print " -      ↓模块介绍↓"
     ui_print " - 删除温控，充电时持续修改电池温度，让系统认为电池温度一直是28℃"
     ui_print " - 持续修改充电电流，以达到最快充电速度"
-    ui_print " - 可选添加温控，若添加，默认当手机温度高于52℃时最高充电电流限制为2A"
+    ui_print " - 可选添加温控，若添加，默认当手机温度高于52℃时最高充电电流限制为4A"
     ui_print " - 可选添加电量控制，若添加，默认电量到达95%时断电，小于等于80%时恢复充电"
     ui_print " - 可选是否关闭阶梯式充电，若选是，默认电量大于15%时关闭阶梯式充电，电量小于等于15%时开启阶梯式充电"
     ui_print " - 可选是否启用“伪”旁路充电，但请注意是“伪”，因为并不是真的旁路供电，而是直接将充电电流降低至500mA"
@@ -149,9 +149,29 @@ on_install()
         check_old_option TEMP_CTRL POWER_CTRL STEP_CHARGING_DISABLED_THRESHOLD
         check_old_option CHARGE_STOP CHARGE_START TEMP_MAX HIGHEST_TEMP_CURRENT
         check_old_option RECHARGE_TEMP BYPASS_CHARGE
+        # 熔断限流值低于3A时按新默认4A处理
+        # 2A在4.2V电池上只有约8.4W，一旦进入温度熔断，充电慢到几乎停滞。
+        # v73起熔断改成带滞回的常态策略（不再是"偶尔触发一次的极端保护"），
+        # 限流值继续留在2A会让保护区间变成"基本不充电"，所以低值统一升到4A
+        _old_htc=$(grep "^HIGHEST_TEMP_CURRENT=" /data/adb/turbo-charge/option.txt | sed "s/^HIGHEST_TEMP_CURRENT=//g")
+        if [[ -n "${_old_htc}" ]] && echo "${_old_htc}" | grep -q '^[0-9][0-9]*$' && [[ "${_old_htc}" -lt 3000000 ]]; then
+            sed -i "s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=4000000/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的HIGHEST_TEMP_CURRENT=${_old_htc}偏低，熔断时功率不足8W，已更新为4000000（约16.8W）"
+        fi
+        # 旧的FORCE_TEMP_MAX=45正好压在多数机型充电常态温度区间（45~47℃），
+        # 会让充电大部分时间处于熔断限流，不再沿用旧值，直接使用新默认48℃
+        _old_ftm=$(grep "^FORCE_TEMP_MAX=" /data/adb/turbo-charge/option.txt | sed "s/^FORCE_TEMP_MAX=//g")
+        if [[ -n "${_old_ftm}" ]] && echo "${_old_ftm}" | grep -q '^[0-9][0-9]*$'; then
+            if [[ "${_old_ftm}" -lt 47 ]]; then
+                ui_print "  - 旧的FORCE_TEMP_MAX=${_old_ftm}℃偏低（充电常态温度就在45~47℃），已改用新的48℃"
+            else
+                ui_print "  - 旧的FORCE_TEMP_MAX=${_old_ftm}℃保留"
+                sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=${_old_ftm}/g" ${TMPDIR}/option.txt
+            fi
+        fi
     else
         ui_print " 旧配置文件不存在，使用默认配置"
-        ui_print "  - 添加温控，当温度高于52℃时限制最高充电电流为2A，低于45℃时恢复"
+        ui_print "  - 添加温控，当温度高于52℃时限制最高充电电流为4A，低于45℃时恢复"
         ui_print "  - 不添加电量控制"
         ui_print "  - 不关闭阶梯式充电"
         ui_print "  - 启用强制显示28℃功能"
