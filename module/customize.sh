@@ -169,13 +169,20 @@ on_install()
                 sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=${_old_ftm}/g" ${TMPDIR}/option.txt
             fi
         fi
+        # v78：49℃ 是 v75/v76/v77 的默认值。那三版因为单位换算写错10倍，
+        # 熔断实际上从来没有触发过（49℃被当成490℃），所以49℃这个值本身没有实测依据。
+        # 修好之后按“平衡档”定为52℃，满速段大约维持到电量30~40%
+        if [[ "${_old_ftm}" == "49" ]]; then
+            sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=52/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的FORCE_TEMP_MAX=49℃已按平衡档更新为52℃，满速段约维持到30~40%"
+        fi
         # 上一版(v74)的默认组合是 熔断48/解除45/限流4A。
         # 实测该组合仍会在47.9℃触发熔断，把34W打到16.6W；v75把三值一起改为 49/46/6A。
         # 只在三项"完全等于上一版默认"时才整体升级，避免覆盖用户自己调过的值
         _old_gr=$(grep "^GUARD_RECOVER=" /data/adb/turbo-charge/option.txt | sed "s/^GUARD_RECOVER=//g")
         if [[ "${_old_ftm}" == "48" && "${_old_gr}" == "45" && "${_old_htc}" == "4000000" ]]; then
-            sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=49/g; s/^GUARD_RECOVER=.*/GUARD_RECOVER=46/g; s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=6000000/g" ${TMPDIR}/option.txt
-            ui_print "  - 检测到上一版的默认温度策略（48℃/45℃/4A），已整体升级为49℃/46℃/6A"
+            sed -i "s/^FORCE_TEMP_MAX=.*/FORCE_TEMP_MAX=52/g; s/^GUARD_RECOVER=.*/GUARD_RECOVER=46/g; s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=6000000/g" ${TMPDIR}/option.txt
+            ui_print "  - 检测到上一版的默认温度策略（48℃/45℃/4A），已整体升级为52℃/46℃/6A"
         fi
         # v76：旧默认 TEMP_MAX=52 会被满速充电时的主板温度（实测峰值54.4℃）长期触发，
         # 把功率压在26W并且几乎出不来；RECHARGE_TEMP=45 永远达不到，等于进了出不去。

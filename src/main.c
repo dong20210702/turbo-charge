@@ -566,6 +566,8 @@ int main()
     int applied_current=0,full_handled=0;
     //温度熔断锁存状态：1=当前处于熔断降流，0=正常分段。跨轮次保留，用来实现滞回
     static int guard_latched=0;
+    //临界温度锁存状态：1=当前处于第二级降流（温度过高），0=未触发
+    static int crit_latched=0;
     time_t last_reapply_time=0;
     pthread_t thread1 = {0},thread2 = {0};
     //初始化链表
@@ -620,8 +622,9 @@ int main()
         if(!option_load_ready) printf_with_time("警告：配置文件读取超时，以下策略为本次使用的值，可能尚未与option.txt同步");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
-        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 温控%d℃进%d℃出",
+        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 临界%d℃降为%dμA / 温控%d℃进%d℃出",
                          guard_on_show, guard_off_show, read_one_option("HIGHEST_TEMP_CURRENT"),
+                         read_one_option("CRITICAL_TEMP"), read_one_option("CRITICAL_CURRENT"),
                          read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
         if(gap < 2) printf_with_time("警告：熔断阈值与解除阈值只差%d℃，等于没有滞回，温度抖动会导致大电流和小电流每秒来回切，建议拉开3℃以上", gap);
         if(guard_on_show <= 46) printf_with_time("警告：熔断阈值%d℃偏低，多数机型充电时的常态温度就在45~47℃，阈值压在这个区间会让充电大部分时间处于限流状态", guard_on_show);
@@ -838,8 +841,25 @@ int main()
                         }
                         else if(step_charge == 2) (read_one_option("STEP_CHARGING_DISABLED") == 1)?step_charge_ctl("0"):step_charge_ctl("1");
                         //向电流文件中写入限制电流数值
-                        set_current_array(current_max_file, current_max_unit, current_max_file_num, atoi(highest_temp_current_char));
-                        charge_log_sample(atoi(power), charge, atoi(highest_temp_current_char), "TEMP-CTRL", temp_sensor);
+                        /*
+                        这里的临界判断不能省：TEMP-CTRL 是一个内层循环，
+                        一旦进去就不会再走外层的熔断/临界逻辑，温度继续上升也没有任何反应。
+                        实测温控生效后（限制6A）电池侧温度仍会停在59~62℃，
+                        必须在这一层再判一次，超过临界阈值进一步降到CRITICAL_CURRENT
+                        */
+                        int inner_current=atoi(highest_temp_current_char);
+                        int crit_on_inner=read_one_option("CRITICAL_TEMP");
+                        int crit_cur_inner=read_one_option("CRITICAL_CURRENT");
+                        int real_tenth_inner=0;
+                        if(crit_on_inner < read_one_option("FORCE_TEMP_MAX")+2) crit_on_inner=read_one_option("FORCE_TEMP_MAX")+2;
+                        if(crit_cur_inner < 100000) crit_cur_inner=100000;
+                        if(read_battery_real_temp(&real_tenth_inner) && real_tenth_inner >= crit_on_inner*10)
+                        {
+                            inner_current=crit_cur_inner;
+                            if(should_log()) printf_with_time("电池温度%.1f℃超过临界阈值%d℃，在温控限流基础上进一步降到%dμA", (double)real_tenth_inner/10.0, crit_on_inner, inner_current);
+                        }
+                        set_current_array(current_max_file, current_max_unit, current_max_file_num, inner_current);
+                        charge_log_sample(atoi(power), charge, inner_current, (inner_current == crit_cur_inner)?"TEMP-CRIT":"TEMP-CTRL", temp_sensor);
                         //充电时强制显示28度功能
                         //此处已经处于高温限流状态，温度基本都超过FORCE_TEMP_MAX，
                         //set_temp(tempwall=1)会把真实温度交给系统，不再继续伪装
@@ -869,7 +889,14 @@ int main()
                 */
                 int real_tenth=0;
                 int have_bat_temp=read_battery_real_temp(&real_tenth);
-                if(have_bat_temp) real_temp=real_tenth*10;
+                /*
+                read_battery_real_temp() 返回的是0.1℃制（47.2℃ → 472），
+                而下面所有阈值比较都按0.001℃制（47.2℃ → 47200），所以必须乘100。
+                v76/v77 这里误写成乘10，49℃的阈值实际变成了490℃，熔断从来没有触发过 ——
+                实测电池侧温度一路冲到62.9℃，模块全程没有任何干预。这个错误不会再犯：
+                两个单位制之间只差10倍还是100倍，写反了不会有任何报错，只会安静地失效。
+                */
+                if(have_bat_temp) real_temp=real_tenth*100;
                 else if(!read_temp(temp_sensor, &real_temp)) real_temp=0;
                 if(real_temp > 0)
                 {
@@ -884,28 +911,61 @@ int main()
                     */
                     int guard_on=read_one_option("FORCE_TEMP_MAX");
                     int guard_off=read_one_option("GUARD_RECOVER");
-                    int was_latched=guard_latched;
+                    int crit_on=read_one_option("CRITICAL_TEMP");
+                    int crit_current=read_one_option("CRITICAL_CURRENT");
+                    int was_latched=guard_latched,was_crit=crit_latched;
                     if(guard_on < 35) guard_on=35;
                     //配置写反或没留间隔时强制留出3℃滞回，否则等于没有滞回
                     if(guard_off >= guard_on-1) guard_off=guard_on-3;
                     if(guard_off < 30) guard_off=30;
+                    //临界阈值必须高于熔断阈值，否则第一级永远不会单独生效
+                    if(crit_on < guard_on+2) crit_on=guard_on+2;
+                    if(crit_current < 100000) crit_current=100000;
                     if(real_temp >= guard_on*1000) guard_latched=1;
                     else if(real_temp <= guard_off*1000) guard_latched=0;
+                    /*
+                    第二级临界降流：只用第一级（6A≈26W）挡不住持续上升的温度，
+                    实测8A满速时温度以约1℃/分的速度往上爬，6A区间仍然会停在60℃以上。
+                    超过临界阈值再降一档到CRITICAL_CURRENT，解除条件同样回到GUARD_RECOVER，
+                    两级共用一个解除阈值，避免出现"温度刚好在两级之间反复横跳"的状态。
+                    */
+                    if(real_temp >= crit_on*1000) crit_latched=1;
+                    else if(real_temp <= guard_off*1000) crit_latched=0;
                     if(guard_latched)
                     {
-                        applied_current=atoi(highest_temp_current_char);
-                        snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
-                        if(!was_latched) printf_with_time("电池温度%.1f℃达到熔断阈值%d℃，电流限制为%dμA（降到%d℃以下才解除）", (double)real_temp/1000.0, guard_on, applied_current, guard_off);
-                        else if(should_log()) printf_with_time("电池温度%.1f℃仍在熔断区间（%d~%d℃），电流保持%dμA", (double)real_temp/1000.0, guard_off, guard_on, applied_current);
+                        if(crit_latched)
+                        {
+                            applied_current=crit_current;
+                            snprintf(stage_name, sizeof(stage_name), "TEMP-CRIT");
+                            if(!was_crit) printf_with_time("电池温度%.1f℃超过临界阈值%d℃，电流进一步降到%dμA，请立即停止亮屏重负载", (double)real_temp/1000.0, crit_on, applied_current);
+                            else if(should_log()) printf_with_time("电池温度%.1f℃仍在临界区间，电流保持%dμA", (double)real_temp/1000.0, applied_current);
+                        }
+                        else
+                        {
+                            applied_current=atoi(highest_temp_current_char);
+                            snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
+                            if(!was_latched) printf_with_time("电池温度%.1f℃达到熔断阈值%d℃，电流限制为%dμA（降到%d℃以下才解除）", (double)real_temp/1000.0, guard_on, applied_current, guard_off);
+                            else if(should_log()) printf_with_time("电池温度%.1f℃仍在熔断区间（%d~%d℃），电流保持%dμA", (double)real_temp/1000.0, guard_off, guard_on, applied_current);
+                        }
                     }
                     else if(was_latched) printf_with_time("电池温度%.1f℃已降到恢复阈值%d℃以下，解除熔断，恢复分段电流%dμA", (double)real_temp/1000.0, guard_off, applied_current);
                 }
                 else if(guard_latched)
                 {
                     //读不到温度时沿用上一次的熔断状态，绝不因为"读不到"就放开大电流
-                    applied_current=atoi(highest_temp_current_char);
-                    snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
-                    if(should_log()) printf_with_time("暂时无法读取温度，保持熔断状态，电流%dμA", applied_current);
+                    if(crit_latched)
+                    {
+                        int crit_current=read_one_option("CRITICAL_CURRENT");
+                        if(crit_current < 100000) crit_current=100000;
+                        applied_current=crit_current;
+                        snprintf(stage_name, sizeof(stage_name), "TEMP-CRIT");
+                    }
+                    else
+                    {
+                        applied_current=atoi(highest_temp_current_char);
+                        snprintf(stage_name, sizeof(stage_name), "TEMP-GUARD");
+                    }
+                    if(should_log()) printf_with_time("暂时无法读取温度，保持降流状态，电流%dμA", applied_current);
                 }
             }
             //向电流文件中写入本轮允许的最大充电电流
