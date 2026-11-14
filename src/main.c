@@ -611,6 +611,13 @@ int main()
     结果就是充电全程都在熔断降流里跑，日志里只看得到一个很低的平均功率，很难定位
     */
     {
+        /*
+        等配置线程读完第一遍再打印，否则打印的是编译期默认值而不是option.txt里的实际值
+        最多等2秒：配置文件异常读不出来时不能把启动过程卡死
+        */
+        int wait_ms=0;
+        while(!option_load_ready && wait_ms < 2000) { usleep(20000); wait_ms+=20; }
+        if(!option_load_ready) printf_with_time("警告：配置文件读取超时，以下策略为本次使用的值，可能尚未与option.txt同步");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
         printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 温控%d℃进%d℃出",
@@ -624,7 +631,13 @@ int main()
         而电池可能只有47℃，拿它当电池温度判断会在电池并不热的时候误降流
         */
         const char *bzone=battery_zone_path();
-        if(bzone != NULL) printf_with_time("电池真实温度观测通道：%s", (char *)bzone);
+        const char *btype=battery_zone_type();
+        if(bzone != NULL)
+        {
+            printf_with_time("电池真实温度观测通道：%s（type=%s）", (char *)bzone, (btype != NULL)?(char *)btype:"未知");
+            if(battery_zone_is_mirror())
+                printf_with_time("警告：该节点是 power_supply battery/temp 的镜像，本模块把温度伪造成28℃后它也会跟着变成28.0，日志的tbat_raw列将失去参考价值。请执行 ls /sys/class/thermal/ 并把每个 thermal_zoneN/type 的内容发给模块作者以适配本机");
+        }
         else printf_with_time("警告：thermal子系统中找不到电池温度传感器，真实温度只能退回bms/temp，而它会被本模块伪装成28℃，日志tbat_raw列将失去参考价值");
     }
     printf_with_time("文件检测完毕，程序开始运行");

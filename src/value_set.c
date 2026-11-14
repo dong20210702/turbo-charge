@@ -19,27 +19,50 @@ mtktsbtsnrpa / mtktsbtsmdpa 这类电池温度传感器（BTS = battery sensor�
 伪装生效后仍然读得到真值，正好用来做熔断判断和日志观测。
 */
 static char bat_zone_temp_path[160]={0};
+static char bat_zone_type_name[64]={0};
 static int bat_zone_checked=0;
+static int bat_zone_mirror=0;
 
 static void probe_battery_zone(void)
 {
     DIR *dir=NULL;
     struct dirent *ent=NULL;
     char type_path[192]={0},type[64]={0};
+    int round=0;
     bat_zone_checked=1;
-    dir=opendir("/sys/class/thermal");
-    if(dir == NULL) return;
-    while((ent=readdir(dir)) != NULL)
+    /*
+    分两轮找，第一轮只认 MTK 的独立电池传感器 mtktsbtsnrpa / mtktsbtsmdpa（BTS = battery sensor）
+    这类节点由fuelgauge直接上报，和 /sys/class/power_supply 完全独立，伪装不会影响它
+    第二轮才接受 type 里带 battery 的节点 —— 实测天玑平台的 thermal_zone 里存在一个
+    由 power_supply battery/temp 转发出来的镜像 zone，本模块把 battery/temp 写成28℃之后
+    它也跟着变成28.0，拿它做观测等于什么都没测（v76首次运行就踩了这个坑）
+    */
+    for(round=0;round < 2;round++)
     {
-        if(strncmp(ent->d_name, "thermal_zone", 12) != 0) continue;
-        snprintf(type_path, sizeof(type_path), "/sys/class/thermal/%s/type", ent->d_name);
-        type[0]='\0';
-        if(!read_file(type_path, type, sizeof(type))) continue;
-        if(strstr(type, "bts") == NULL && strstr(type, "battery") == NULL) continue;
-        snprintf(bat_zone_temp_path, sizeof(bat_zone_temp_path), "/sys/class/thermal/%s/temp", ent->d_name);
-        break;
+        dir=opendir("/sys/class/thermal");
+        if(dir == NULL) return;
+        while((ent=readdir(dir)) != NULL)
+        {
+            if(strncmp(ent->d_name, "thermal_zone", 12) != 0) continue;
+            snprintf(type_path, sizeof(type_path), "/sys/class/thermal/%s/type", ent->d_name);
+            type[0]='\0';
+            if(!read_file(type_path, type, sizeof(type))) continue;
+            if(round == 0)
+            {
+                if(strstr(type, "bts") == NULL) continue;
+            }
+            else
+            {
+                if(strstr(type, "battery") == NULL) continue;
+            }
+            snprintf(bat_zone_temp_path, sizeof(bat_zone_temp_path), "/sys/class/thermal/%s/temp", ent->d_name);
+            snprintf(bat_zone_type_name, sizeof(bat_zone_type_name), "%s", type);
+            bat_zone_mirror=(round == 1);
+            closedir(dir);
+            return;
+        }
+        closedir(dir);
     }
-    closedir(dir);
 }
 
 /*
@@ -77,6 +100,20 @@ const char *battery_zone_path(void)
 {
     if(!bat_zone_checked) probe_battery_zone();
     return (bat_zone_temp_path[0] != '\0')?bat_zone_temp_path:NULL;
+}
+
+//返回该节点的 thermal type 名称，未找到返回NULL
+const char *battery_zone_type(void)
+{
+    if(!bat_zone_checked) probe_battery_zone();
+    return (bat_zone_type_name[0] != '\0')?bat_zone_type_name:NULL;
+}
+
+//返回1表示只能用 type=battery 的镜像节点，伪装生效后它也会变成28℃，观测价值有限
+int battery_zone_is_mirror(void)
+{
+    if(!bat_zone_checked) probe_battery_zone();
+    return bat_zone_mirror;
 }
 
 /*

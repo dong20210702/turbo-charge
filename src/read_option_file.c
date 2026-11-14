@@ -15,6 +15,14 @@
 #include "printf_with_time.h"
 
 /*
+首次解析完成标志
+配置由子线程异步读取，主线程启动时打印策略摘要如果不等这一步，
+读到的是 insert_all_option() 写入的编译期默认值，而不是用户配置文件里的实际值，
+表现为"日志显示温控52℃进45℃出，但option.txt里明明写的是58/50"这种误导性信息
+*/
+volatile int option_load_ready=0;
+
+/*
 读取配置文件并赋值给程序内部变量
 */
 void *read_option_file(void *arg)
@@ -241,6 +249,7 @@ void *read_option_file(void *arg)
             }
         }
         first_pass=0;
+        option_load_ready=1;
         pthread_mutex_unlock((pthread_mutex_t *)&mutex_options);
     }
     return NULL;
