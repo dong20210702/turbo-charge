@@ -4,6 +4,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include "charge_log.h"
@@ -111,6 +112,15 @@ static const char *vin_candidates[]={
 };
 static const char *icl_path = NULL;
 static const char *vin_path = NULL;
+/*
+扫到的真实输入电压节点
+候选表在MTK上经常全部落空：mtk-master-charger没有voltage_now，
+usb/voltage_now报的是10mV这种无效差值。与其继续猜节点名，
+不如直接把power_supply下每个节点的voltage_now都读一遍，
+取3.5V~30V区间里的最大值——电池电压被排除，剩下的最大值必然是充电器输入
+*/
+static char vin_scan_path[192]={0};
+static int vin_scanned=0;
 
 static const char *pick_current_node(const char **candidates, long min_value)
 {
@@ -138,12 +148,72 @@ static void put_icl(FILE *fp)
     else fprintf(fp, "%.3f", (double)value/1e6);
 }
 
-static void put_vin(FILE *fp)
+/*
+遍历 /sys/class/power_supply 下所有节点，挑出真正的充电器输入电压
+输入电压的正常量级是 5V/9V/11V/20V（μV制即 5000000 起），
+所以区间取 3.5V~30V：低于3.5V只可能是无效读数或单节电芯电压，
+高于30V不可能是USB PD档位。电池自身的电压被排除，避免把 vbat 当成 vin
+扫描结果只打一次日志，方便用户确认本机到底哪个节点才是输入电压
+*/
+static void scan_voltage_nodes(void)
+{
+    DIR *dir=NULL;
+    struct dirent *ent=NULL;
+    char path[192]={0};
+    char list[1024]={0};
+    long value=0,best=0;
+    int n=0;
+    vin_scanned=1;
+    vin_scan_path[0]='\0';
+    dir=opendir("/sys/class/power_supply");
+    if(dir == NULL) return;
+    while((ent=readdir(dir)) != NULL)
+    {
+        if(ent->d_name[0] == '.') continue;
+        if(!strncmp(ent->d_name, "battery", 7)) continue;
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/voltage_now", ent->d_name);
+        if(!read_long(path, &value)) continue;
+        n=(int)strlen(list);
+        if(n < (int)sizeof(list)-40) snprintf(list+n, sizeof(list)-n, "%s=%.2fV ", ent->d_name, (double)value/1e6);
+        if(value >= 3500000 && value <= 30000000 && value > best)
+        {
+            best=value;
+            snprintf(vin_scan_path, sizeof(vin_scan_path), "%s", path);
+        }
+    }
+    closedir(dir);
+    if(vin_scan_path[0] != '\0')
+        printf_with_time("输入电压节点：%s（扫描到 %s）", vin_scan_path, (list[0] != '\0')?list:"无其他节点");
+    else
+        printf_with_time("警告：power_supply 下找不到可用的输入电压节点，vin_v 列将记为NA（扫描到 %s）", (list[0] != '\0')?list:"无");
+}
+
+static void put_vin(FILE *fp, int charging)
 {
     long value=0;
-    if(vin_path == NULL) vin_path=pick_current_node(vin_candidates, 1000000);
+    /*
+    只在充电时扫描：未插充电器时 power_supply 下本来就没有输入电压，
+    放电阶段扫描必然落空，扫了只会白打一条"找不到节点"的警告
+    */
+    if(!vin_scanned && charging) scan_voltage_nodes();
+    if(vin_scan_path[0] != '\0')
+    {
+        if(read_long(vin_scan_path, &value) && value >= 3500000 && value <= 30000000)
+        {
+            fprintf(fp, "%.2f", (double)value/1e6);
+            return;
+        }
+        //拔插充电器后节点可能重新注册，清掉缓存等下轮重扫
+        vin_scan_path[0]='\0';
+        vin_scanned=0;
+        fputs("NA", fp);
+        return;
+    }
+    if(!charging) { fputs("NA", fp); return; }
+    //扫描落空时才退回候选表
+    if(vin_path == NULL) vin_path=pick_current_node(vin_candidates, 3500000);
     if(vin_path == NULL) { fputs("NA", fp); return; }
-    if(!read_long(vin_path, &value) || value <= 0) { vin_path=NULL; fputs("NA", fp); return; }
+    if(!read_long(vin_path, &value) || value < 3500000 || value > 30000000) { vin_path=NULL; fputs("NA", fp); return; }
     fprintf(fp, "%.2f", (double)value/1e6);
 }
 
@@ -276,7 +346,17 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     fputc(',', log_fp);
 
     //充电器侧：能否看到9V/20V协商结果，是判断"67W套件有没有被识别"的关键
-    put_scaled_abs(log_fp, "/sys/class/power_supply/usb/voltage_now", 1e6, 2);
+    /*
+    usb/voltage_now 在MTK平台上报的是10mV这种无效差值（日志里整轮恒为0.01），
+    直接把原始值写进来会把"读不到"伪装成"读到了0.01V"，比NA更误导。
+    低于3.5V一律记NA；真正的输入电压看后面的 vin_v 列，那一列会自动扫描可用节点
+    */
+    {
+        long uv=0;
+        if(read_long("/sys/class/power_supply/usb/voltage_now", &uv) && uv >= 3500000 && uv <= 30000000)
+            fprintf(log_fp, "%.2f", (double)uv/1e6);
+        else fputs("NA", log_fp);
+    }
     fputc(',', log_fp);
     put_scaled_abs(log_fp, "/sys/class/power_supply/usb/current_now", 1e6, 3);
     fputc(',', log_fp);
@@ -297,7 +377,7 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     //输入限流实际生效值(A)与输入电压(V)：写进去的电流和真正生效的电流往往不是一回事
     put_icl(log_fp);
     fputc(',', log_fp);
-    put_vin(log_fp);
+    put_vin(log_fp, (status != NULL && strcmp(status, "Discharging") != 0));
     fputc(',', log_fp);
 
     //电池健康度：满充容量相对设计容量的比值决定了恒压阶段会提前多久到来

@@ -209,25 +209,35 @@ int probe_unit_factor(const char *path, int *raw_value)
 1.按节点单位自动换算，mA节点写入换算后的数值
 2.节点当前值为负数（MTK未启用的从充电器节点返回-95）时直接跳过，写进去也没有任何作用
 3.值本来就一致时不重复写，减少每秒一次的无谓系统调用
-返回真正发生写入的节点个数
+
+返回值是三态，调用方必须按三态判断：
+ >0  真正发生了写入的节点个数
+  0  所有可用节点的当前值已经等于目标值，属于正常状态（比如接近充满后系统把电流
+     锁在2A，恰好与本模块的分段值一致），绝不是失败
+ -1  有节点需要改写但一个都没写进去，这才是需要告警的情况
+早期版本把“已一致”和“写失败”都返回0，结果快充满阶段每分钟刷一条
+“未能写入任何电流节点”，把真实的写入故障淹没在噪音里
 */
 int set_current_array(char **file, int *unit, int num, int target_ua)
 {
-    int i=0, written=0, factor=1, cur_raw=0;
+    int i=0, written=0, tried=0, factor=1, cur_raw=0;
     char buf[24]={0};
     if(file == NULL || num <= 0) return 0;
     if(target_ua < 0) target_ua=0;
     for(i=0;i < num;i++)
     {
         if(file[i] == NULL) continue;
+        cur_raw=0;
         factor=probe_unit_factor(file[i], &cur_raw);
         if(factor <= 0) continue;
         if(unit != NULL && unit[i] > 0) factor=unit[i];
         if(cur_raw*factor == target_ua) continue;
         snprintf(buf, sizeof(buf), "%d", target_ua/factor);
+        tried++;
         if(set_value(file[i], buf) > 0) written++;
     }
-    return written;
+    if(written > 0) return written;
+    return (tried > 0) ? -1 : 0;
 }
 
 /*

@@ -197,6 +197,28 @@ on_install()
             sed -i "s/^RECHARGE_TEMP=.*/RECHARGE_TEMP=50/g" ${TMPDIR}/option.txt
             ui_print "  - 旧的RECHARGE_TEMP=45℃低于限流后的稳定温度，等于进得去出不来，已更新为50℃"
         fi
+        # v79：CRITICAL_TEMP=60 是 v78 的默认值，但实测 6A 限流下电池真实温度峰值
+        # 就到 59.1℃，这一档全程一次都没触发过，等于不存在。前移到57℃才真正参与控制。
+        # CRITICAL_CURRENT 同步由 3A 提到 4.5A：3A只剩12.6W，为3℃多花十几分钟不划算
+        _old_ct=$(grep "^CRITICAL_TEMP=" /data/adb/turbo-charge/option.txt | sed "s/^CRITICAL_TEMP=//g")
+        _old_cc=$(grep "^CRITICAL_CURRENT=" /data/adb/turbo-charge/option.txt | sed "s/^CRITICAL_CURRENT=//g")
+        if [[ "${_old_ct}" == "60" ]]; then
+            sed -i "s/^CRITICAL_TEMP=.*/CRITICAL_TEMP=57/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的CRITICAL_TEMP=60℃在6A限流下永远达不到，已前移到57℃"
+        fi
+        if [[ "${_old_cc}" == "3000000" ]]; then
+            sed -i "s/^CRITICAL_CURRENT=.*/CRITICAL_CURRENT=4500000/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的CRITICAL_CURRENT=3A降幅过大，已调整为4.5A"
+        fi
+        # v79 新增的配置项：老配置里没有，缺项时程序会用默认值，
+        # 但仍然补写进配置文件，用户才能看见并自己调整
+        for _k in "CRITICAL_RECOVER=54" "SOFT_START_TEMP=50" "SOFT_START_CURRENT=4000000" "SOFT_START_RECOVER=48" "SOFT_START_TIMEOUT=360"; do
+            _kname="${_k%%=*}"
+            if ! grep -q "^${_kname}=" ${TMPDIR}/option.txt; then
+                echo "${_k}" >> ${TMPDIR}/option.txt
+                ui_print "  - 新增配置项 ${_k}"
+            fi
+        done
     else
         ui_print " 旧配置文件不存在，使用默认配置"
         ui_print "  - 添加温控，当温度高于58℃时限制最高充电电流为6A，低于50℃时恢复"

@@ -555,6 +555,88 @@ static int stage_current_limit(int capacity, int current_max, char *stage, int s
     return (int)((long long)peak*percent/100);
 }
 
+/*
+==================== 高温软启动 ====================
+插线瞬间电池已经偏热时，先降流把温度拉下来，再交回熔断/分段策略
+
+为什么需要：v78实测插线时电池49.5℃、插上瞬间52.2℃，直接进熔断锁在6A，
+而6A在这台机器上仍会把温度推到59.1℃。起点高意味着整轮充电都贴着临界阈值跑，
+8A满速一次机会都没有。先4A压几分钟把起点拉低，比让6A硬顶更划算
+
+为什么退出不用温度滞回：软启动退出后会立刻回到6A，若退出阈值定在48℃，
+温度很快被6A推回52~56℃并再次满足软启动条件，形成"4A→6A→4A"的来回切换，
+平均功率反而更低。所以退出只有两条路——降到目标温度，或超时。
+超时兜底必须有：亮屏重负载时4A也可能降不到48℃，没有兜底会一直卡在4A
+*/
+static int soft_start_active=0;
+static time_t soft_start_since=0;
+
+//充电器连接边沿调用：按插线瞬间的电池温度决定是否进入软启动
+static void soft_start_begin(void)
+{
+    int soft_on=0,soft_cur=0,start_tenth=0;
+    soft_start_active=0;
+    soft_on=read_one_option("SOFT_START_TEMP");
+    soft_cur=read_one_option("SOFT_START_CURRENT");
+    if(soft_on <= 0 || soft_cur <= 0) return;
+    //读不到真实温度时不启动：宁可沿用原策略，也不把异常值当成高温
+    if(!read_battery_real_temp(&start_tenth)) return;
+    if(start_tenth < soft_on*10) return;
+    soft_start_active=1;
+    soft_start_since=time(NULL);
+    printf_with_time("插线时电池温度%.1f℃高于软启动阈值%d℃，先用%dμA降温（降到%d℃或满%d秒后恢复原策略）",
+                     (double)start_tenth/10.0, soft_on, soft_cur,
+                     read_one_option("SOFT_START_RECOVER"), read_one_option("SOFT_START_TIMEOUT"));
+}
+
+/*
+对传入的电流上限施加软启动限制，返回最终应写入的值
+只降不升：传入值本身比软启动值更小时保持传入值
+*/
+static int soft_start_limit(int current, char *stage, int stage_size)
+{
+    int soft_cur=0,soft_rec=0,soft_timeout=0,now_tenth=0,have_now=0;
+    long elapsed=0;
+    if(!soft_start_active) return current;
+    soft_cur=read_one_option("SOFT_START_CURRENT");
+    soft_rec=read_one_option("SOFT_START_RECOVER");
+    soft_timeout=read_one_option("SOFT_START_TIMEOUT");
+    if(soft_cur <= 0) { soft_start_active=0; return current; }
+    have_now=read_battery_real_temp(&now_tenth);
+    elapsed=(long)(time(NULL)-soft_start_since);
+    if(have_now && soft_rec > 0 && now_tenth <= soft_rec*10)
+    {
+        soft_start_active=0;
+        printf_with_time("软启动结束：电池温度已降到%.1f℃（目标%d℃），恢复按熔断/分段策略执行", (double)now_tenth/10.0, soft_rec);
+        return current;
+    }
+    if(soft_timeout > 0 && elapsed >= soft_timeout)
+    {
+        soft_start_active=0;
+        printf_with_time("软启动结束：已持续%ld秒仍未降到%d℃，交回熔断/分段策略", elapsed, soft_rec);
+        return current;
+    }
+    /*
+    只有真的把电流压小了才改阶段名
+    熔断/临界已经给出更低的电流时（例如临界4.5A > 软启动4A 是降，3A < 4A 是保持），
+    阶段名必须反映实际生效的那一档，否则日志里会看到"SOFT-START"却写着3A
+    */
+    if(current > 0 && current <= soft_cur)
+    {
+        if(should_log() && have_now) printf_with_time("软启动中：电池温度%.1f℃，维持更低的%dμA（软启动上限%dμA）",
+                                                     (double)now_tenth/10.0, current, soft_cur);
+        return current;
+    }
+    if(stage != NULL && stage_size > 0) snprintf(stage, stage_size, "SOFT-START");
+    if(should_log())
+    {
+        if(have_now) printf_with_time("软启动中：电池温度%.1f℃，电流限制%dμA（降到%d℃或满%ld秒后结束）",
+                                      (double)now_tenth/10.0, soft_cur, soft_rec, (long)soft_timeout-elapsed);
+        else printf_with_time("软启动中：暂时读不到电池温度，电流限制%dμA", soft_cur);
+    }
+    return soft_cur;
+}
+
 int main()
 {
     char *temp_sensor = NULL,**current_limit_file = NULL,**current_max_file = NULL,**temp_file = NULL;
@@ -622,10 +704,19 @@ int main()
         if(!option_load_ready) printf_with_time("警告：配置文件读取超时，以下策略为本次使用的值，可能尚未与option.txt同步");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
-        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 临界%d℃降为%dμA / 温控%d℃进%d℃出",
+        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 临界%d℃降为%dμA（%d℃解除） / 温控%d℃进%d℃出",
                          guard_on_show, guard_off_show, read_one_option("HIGHEST_TEMP_CURRENT"),
                          read_one_option("CRITICAL_TEMP"), read_one_option("CRITICAL_CURRENT"),
+                         read_one_option("CRITICAL_RECOVER"),
                          read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
+        {
+            int soft_on_show=read_one_option("SOFT_START_TEMP");
+            if(soft_on_show > 0)
+                printf_with_time("高温软启动：插线时电池≥%d℃先限%dμA，降到%d℃或满%d秒后恢复原策略",
+                                 soft_on_show, read_one_option("SOFT_START_CURRENT"),
+                                 read_one_option("SOFT_START_RECOVER"), read_one_option("SOFT_START_TIMEOUT"));
+            else printf_with_time("高温软启动：已关闭（SOFT_START_TEMP=0）");
+        }
         if(gap < 2) printf_with_time("警告：熔断阈值与解除阈值只差%d℃，等于没有滞回，温度抖动会导致大电流和小电流每秒来回切，建议拉开3℃以上", gap);
         if(guard_on_show <= 46) printf_with_time("警告：熔断阈值%d℃偏低，多数机型充电时的常态温度就在45~47℃，阈值压在这个区间会让充电大部分时间处于限流状态", guard_on_show);
         /*
@@ -724,6 +815,8 @@ int main()
                 printf_with_time("充电器已连接");
                 last_charge_status=1;
                 is_first_time=0;
+                //插线瞬间电池已经偏热时先降流降温，细节见 soft_start_begin 的说明
+                soft_start_begin();
             }
             /*
             电池充满后不再干预
@@ -850,16 +943,35 @@ int main()
                         int inner_current=atoi(highest_temp_current_char);
                         int crit_on_inner=read_one_option("CRITICAL_TEMP");
                         int crit_cur_inner=read_one_option("CRITICAL_CURRENT");
+                        int crit_rec_inner=read_one_option("CRITICAL_RECOVER");
+                        int guard_off_inner=read_one_option("GUARD_RECOVER");
                         int real_tenth_inner=0;
                         if(crit_on_inner < read_one_option("FORCE_TEMP_MAX")+2) crit_on_inner=read_one_option("FORCE_TEMP_MAX")+2;
                         if(crit_cur_inner < 100000) crit_cur_inner=100000;
-                        if(read_battery_real_temp(&real_tenth_inner) && real_tenth_inner >= crit_on_inner*10)
+                        //与外层同一套滞回：温度超过临界阈值进，跌回CRITICAL_RECOVER出
+                        if(crit_rec_inner >= crit_on_inner-1) crit_rec_inner=crit_on_inner-3;
+                        if(crit_rec_inner < guard_off_inner) crit_rec_inner=guard_off_inner;
+                        if(read_battery_real_temp(&real_tenth_inner))
                         {
-                            inner_current=crit_cur_inner;
-                            if(should_log()) printf_with_time("电池温度%.1f℃超过临界阈值%d℃，在温控限流基础上进一步降到%dμA", (double)real_tenth_inner/10.0, crit_on_inner, inner_current);
+                            if(real_tenth_inner >= crit_on_inner*10) crit_latched=1;
+                            else if(real_tenth_inner <= crit_rec_inner*10) crit_latched=0;
+                            if(crit_latched)
+                            {
+                                inner_current=crit_cur_inner;
+                                if(should_log()) printf_with_time("电池温度%.1f℃处于临界区间（%d℃进/%d℃出），在温控限流基础上进一步降到%dμA",
+                                                                (double)real_tenth_inner/10.0, crit_on_inner, crit_rec_inner, inner_current);
+                            }
                         }
+                        /*
+                        内层温控循环同样要受软启动约束：软启动期间如果主板温度先一步
+                        超过TEMP_MAX就会进到这个循环，这里若不再判一次，4A会被直接
+                        覆盖成6A，软启动等于白做
+                        */
+                        char inner_stage[20]={0};
+                        snprintf(inner_stage, sizeof(inner_stage), "%s", (inner_current == crit_cur_inner)?"TEMP-CRIT":"TEMP-CTRL");
+                        inner_current=soft_start_limit(inner_current, inner_stage, sizeof(inner_stage));
                         set_current_array(current_max_file, current_max_unit, current_max_file_num, inner_current);
-                        charge_log_sample(atoi(power), charge, inner_current, (inner_current == crit_cur_inner)?"TEMP-CRIT":"TEMP-CTRL", temp_sensor);
+                        charge_log_sample(atoi(power), charge, inner_current, inner_stage, temp_sensor);
                         //充电时强制显示28度功能
                         //此处已经处于高温限流状态，温度基本都超过FORCE_TEMP_MAX，
                         //set_temp(tempwall=1)会把真实温度交给系统，不再继续伪装
@@ -913,6 +1025,7 @@ int main()
                     int guard_off=read_one_option("GUARD_RECOVER");
                     int crit_on=read_one_option("CRITICAL_TEMP");
                     int crit_current=read_one_option("CRITICAL_CURRENT");
+                    int crit_recover=read_one_option("CRITICAL_RECOVER");
                     int was_latched=guard_latched,was_crit=crit_latched;
                     if(guard_on < 35) guard_on=35;
                     //配置写反或没留间隔时强制留出3℃滞回，否则等于没有滞回
@@ -921,16 +1034,23 @@ int main()
                     //临界阈值必须高于熔断阈值，否则第一级永远不会单独生效
                     if(crit_on < guard_on+2) crit_on=guard_on+2;
                     if(crit_current < 100000) crit_current=100000;
+                    /*
+                    临界档的解除阈值必须独立于熔断档
+                    沿用熔断的46℃会让临界档一旦触发就永久锁死：充电中后段的温度
+                    长期在50~58℃之间，跌到46℃基本只可能发生在恒压区尾段
+                    */
+                    if(crit_recover >= crit_on-1) crit_recover=crit_on-3;
+                    if(crit_recover < guard_off) crit_recover=guard_off;
                     if(real_temp >= guard_on*1000) guard_latched=1;
                     else if(real_temp <= guard_off*1000) guard_latched=0;
                     /*
                     第二级临界降流：只用第一级（6A≈26W）挡不住持续上升的温度，
                     实测8A满速时温度以约1℃/分的速度往上爬，6A区间仍然会停在60℃以上。
-                    超过临界阈值再降一档到CRITICAL_CURRENT，解除条件同样回到GUARD_RECOVER，
-                    两级共用一个解除阈值，避免出现"温度刚好在两级之间反复横跳"的状态。
+                    超过临界阈值再降一档到CRITICAL_CURRENT，解除条件回到CRITICAL_RECOVER，
+                    与熔断档的46℃分开，避免"触发一次就锁死到充满"
                     */
                     if(real_temp >= crit_on*1000) crit_latched=1;
-                    else if(real_temp <= guard_off*1000) crit_latched=0;
+                    else if(real_temp <= crit_recover*1000) crit_latched=0;
                     if(guard_latched)
                     {
                         if(crit_latched)
@@ -968,8 +1088,11 @@ int main()
                     if(should_log()) printf_with_time("暂时无法读取温度，保持降流状态，电流%dμA", applied_current);
                 }
             }
+            //高温软启动：只降不升，与分段/熔断/临界取最小值叠加
+            applied_current=soft_start_limit(applied_current, stage_name, sizeof(stage_name));
             //向电流文件中写入本轮允许的最大充电电流
-            if(current_change && !set_current_array(current_max_file, current_max_unit, current_max_file_num, applied_current)
+            //返回0表示节点当前值已等于目标（快充满时系统自己降到同一个值），不需要告警
+            if(current_change && set_current_array(current_max_file, current_max_unit, current_max_file_num, applied_current) < 0
                && should_log()) printf_with_time("本轮未能写入任何电流节点（共%d个），节点可能已被系统独占，稍后重试", current_max_file_num);
             charge_log_sample(atoi(power), charge, applied_current, stage_name, temp_sensor);
         }
