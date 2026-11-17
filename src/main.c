@@ -559,9 +559,15 @@ static int stage_current_limit(int capacity, int current_max, char *stage, int s
 ==================== 高温软启动 ====================
 插线瞬间电池已经偏热时，先降流把温度拉下来，再交回熔断/分段策略
 
-为什么需要：v78实测插线时电池49.5℃、插上瞬间52.2℃，直接进熔断锁在6A，
-而6A在这台机器上仍会把温度推到59.1℃。起点高意味着整轮充电都贴着临界阈值跑，
-8A满速一次机会都没有。先4A压几分钟把起点拉低，比让6A硬顶更划算
+来历：v78实测插线时电池49.5℃、插上瞬间52.2℃，直接进熔断锁在6A，
+而6A在这台机器上仍会把温度推到59.1℃。当时的设想是先4A压几分钟把起点拉低
+
+v79 实测否定了这个设想，因此默认关闭（SOFT_START_TEMP=0），代码保留备用：
+  插线瞬间电池电流本身从1.2A自然爬升，4A限流在前20秒完全不起作用；
+  等电流真的碰到4A时温度已经52.7℃，限流真正生效只有65秒、
+  温度降到48.2℃就退出，随后6A用16分钟又顶回57℃。
+  净效果只是延后90秒，还白扔一段4A低功率（15.6W vs 25W），少充约0.5个点。
+  想重新启用把 SOFT_START_TEMP 改到 45~50 即可
 
 为什么退出不用温度滞回：软启动退出后会立刻回到6A，若退出阈值定在48℃，
 温度很快被6A推回52~56℃并再次满足软启动条件，形成"4A→6A→4A"的来回切换，
@@ -650,6 +656,8 @@ int main()
     static int guard_latched=0;
     //临界温度锁存状态：1=当前处于第二级降流（温度过高），0=未触发
     static int crit_latched=0;
+    //临界锁存的起始时刻，用于CRITICAL_HOLD最短保持时间判定
+    static time_t crit_since=0;
     time_t last_reapply_time=0;
     pthread_t thread1 = {0},thread2 = {0};
     //初始化链表
@@ -704,11 +712,16 @@ int main()
         if(!option_load_ready) printf_with_time("警告：配置文件读取超时，以下策略为本次使用的值，可能尚未与option.txt同步");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
-        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 临界%d℃降为%dμA（%d℃解除） / 温控%d℃进%d℃出",
+        printf_with_time("温度策略：熔断%d℃ / 解除%d℃ / 限流%dμA / 临界%d℃降为%dμA（%d℃解除，至少保持%d秒） / 温控%d℃进%d℃出",
                          guard_on_show, guard_off_show, read_one_option("HIGHEST_TEMP_CURRENT"),
                          read_one_option("CRITICAL_TEMP"), read_one_option("CRITICAL_CURRENT"),
-                         read_one_option("CRITICAL_RECOVER"),
+                         read_one_option("CRITICAL_RECOVER"), read_one_option("CRITICAL_HOLD"),
                          read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
+        {
+            int boost_show=read_one_option("INPUT_CURRENT_BOOST");
+            if(boost_show > 0)
+                printf_with_time("警告：输入限流提升实验已开启，input_current_limit 固定写为%dμA。若充电器不支持更高电压档，可能出现掉到5V慢充，请在本轮充电中确认 icl_a/vin_v 是否正常；不需要时把 INPUT_CURRENT_BOOST 改回0", boost_show);
+        }
         {
             int soft_on_show=read_one_option("SOFT_START_TEMP");
             if(soft_on_show > 0)
@@ -944,22 +957,32 @@ int main()
                         int crit_on_inner=read_one_option("CRITICAL_TEMP");
                         int crit_cur_inner=read_one_option("CRITICAL_CURRENT");
                         int crit_rec_inner=read_one_option("CRITICAL_RECOVER");
+                        int crit_hold_inner=read_one_option("CRITICAL_HOLD");
                         int guard_off_inner=read_one_option("GUARD_RECOVER");
                         int real_tenth_inner=0;
                         if(crit_on_inner < read_one_option("FORCE_TEMP_MAX")+2) crit_on_inner=read_one_option("FORCE_TEMP_MAX")+2;
                         if(crit_cur_inner < 100000) crit_cur_inner=100000;
-                        //与外层同一套滞回：温度超过临界阈值进，跌回CRITICAL_RECOVER出
+                        //与外层同一套滞回：温度超过临界阈值进，跌回CRITICAL_RECOVER出，且至少保持CRITICAL_HOLD秒
                         if(crit_rec_inner >= crit_on_inner-1) crit_rec_inner=crit_on_inner-3;
                         if(crit_rec_inner < guard_off_inner) crit_rec_inner=guard_off_inner;
+                        if(crit_hold_inner < 0) crit_hold_inner=0;
                         if(read_battery_real_temp(&real_tenth_inner))
                         {
-                            if(real_tenth_inner >= crit_on_inner*10) crit_latched=1;
-                            else if(real_tenth_inner <= crit_rec_inner*10) crit_latched=0;
+                            if(real_tenth_inner >= crit_on_inner*10)
+                            {
+                                if(!crit_latched) crit_since=time(NULL);
+                                crit_latched=1;
+                            }
+                            else if(crit_latched && real_tenth_inner <= crit_rec_inner*10
+                                    && (crit_hold_inner <= 0 || (long)(time(NULL)-crit_since) >= crit_hold_inner))
+                            {
+                                crit_latched=0;
+                            }
                             if(crit_latched)
                             {
                                 inner_current=crit_cur_inner;
-                                if(should_log()) printf_with_time("电池温度%.1f℃处于临界区间（%d℃进/%d℃出），在温控限流基础上进一步降到%dμA",
-                                                                (double)real_tenth_inner/10.0, crit_on_inner, crit_rec_inner, inner_current);
+                                if(should_log()) printf_with_time("电池温度%.1f℃处于临界区间（%d℃进/%d℃出，最短保持%d秒），在温控限流基础上进一步降到%dμA",
+                                                                (double)real_tenth_inner/10.0, crit_on_inner, crit_rec_inner, crit_hold_inner, inner_current);
                             }
                         }
                         /*
@@ -1026,6 +1049,7 @@ int main()
                     int crit_on=read_one_option("CRITICAL_TEMP");
                     int crit_current=read_one_option("CRITICAL_CURRENT");
                     int crit_recover=read_one_option("CRITICAL_RECOVER");
+                    int crit_hold=read_one_option("CRITICAL_HOLD");
                     int was_latched=guard_latched,was_crit=crit_latched;
                     if(guard_on < 35) guard_on=35;
                     //配置写反或没留间隔时强制留出3℃滞回，否则等于没有滞回
@@ -1048,17 +1072,35 @@ int main()
                     实测8A满速时温度以约1℃/分的速度往上爬，6A区间仍然会停在60℃以上。
                     超过临界阈值再降一档到CRITICAL_CURRENT，解除条件回到CRITICAL_RECOVER，
                     与熔断档的46℃分开，避免"触发一次就锁死到充满"
+                    CRITICAL_HOLD 是最短保持时间：温度读数有±1.5℃抖动，
+                    v79实测从57℃降到55.4℃、只保持3.5分钟就放回6A，随后立刻回升到56.3℃。
+                    不加这个，6A→57℃→4.5A→53℃→6A 会周期性横跳，平均功率反而更低
                     */
-                    if(real_temp >= crit_on*1000) crit_latched=1;
-                    else if(real_temp <= crit_recover*1000) crit_latched=0;
+                    if(crit_hold < 0) crit_hold=0;
+                    if(real_temp >= crit_on*1000)
+                    {
+                        if(!crit_latched) crit_since=time(NULL);
+                        crit_latched=1;
+                    }
+                    else if(crit_latched && real_temp <= crit_recover*1000
+                            && (crit_hold <= 0 || (long)(time(NULL)-crit_since) >= crit_hold))
+                    {
+                        crit_latched=0;
+                    }
                     if(guard_latched)
                     {
                         if(crit_latched)
                         {
                             applied_current=crit_current;
                             snprintf(stage_name, sizeof(stage_name), "TEMP-CRIT");
-                            if(!was_crit) printf_with_time("电池温度%.1f℃超过临界阈值%d℃，电流进一步降到%dμA，请立即停止亮屏重负载", (double)real_temp/1000.0, crit_on, applied_current);
-                            else if(should_log()) printf_with_time("电池温度%.1f℃仍在临界区间，电流保持%dμA", (double)real_temp/1000.0, applied_current);
+                            if(!was_crit) printf_with_time("电池温度%.1f℃超过临界阈值%d℃，电流进一步降到%dμA（%d℃解除且至少保持%d秒），请立即停止亮屏重负载", (double)real_temp/1000.0, crit_on, applied_current, crit_recover, crit_hold);
+                            else if(should_log())
+                            {
+                                long held=(long)(time(NULL)-crit_since);
+                                if(real_temp <= crit_recover*1000 && crit_hold > 0 && held < crit_hold)
+                                    printf_with_time("电池温度%.1f℃已回到解除阈值%d℃以下，但临界最短保持%d秒未到（已保持%ld秒），电流暂保持%dμA", (double)real_temp/1000.0, crit_recover, crit_hold, held, applied_current);
+                                else printf_with_time("电池温度%.1f℃仍在临界区间，电流保持%dμA", (double)real_temp/1000.0, applied_current);
+                            }
                         }
                         else
                         {
@@ -1090,10 +1132,81 @@ int main()
             }
             //高温软启动：只降不升，与分段/熔断/临界取最小值叠加
             applied_current=soft_start_limit(applied_current, stage_name, sizeof(stage_name));
-            //向电流文件中写入本轮允许的最大充电电流
-            //返回0表示节点当前值已等于目标（快充满时系统自己降到同一个值），不需要告警
-            if(current_change && set_current_array(current_max_file, current_max_unit, current_max_file_num, applied_current) < 0
-               && should_log()) printf_with_time("本轮未能写入任何电流节点（共%d个），节点可能已被系统独占，稍后重试", current_max_file_num);
+            /*
+            输入限流提升实验（INPUT_CURRENT_BOOST，默认0关闭）
+            电池侧电流受温度约束，但实测的 26W 天花板在输入侧：
+            v79 满速段 icl 整轮恒为 3.225A，按88%效率反推输入 8.87V，即适配器在 9V 档，
+            9V×3.225A=29W 就是输入上限，输出不可能超过 26W。
+            想让输出上 30W（7A@4.3V 需 34W 输入），必须让 PD 重协商到 11V/20V 档。
+            这里把 input_current_limit 单独写大，不跟随电池电流，试探内核会不会重新协商。
+            注意必须先把该节点从 current_max_file 里摘掉：否则 set_current_array 每轮
+            都会把它改回 applied_current（临界降流时是4.5A），和本项写入互相覆盖，
+            输入限流会在两个值之间每秒抖动，AICL 反而更容易误判
+            */
+            {
+                int boost=read_one_option("INPUT_CURRENT_BOOST");
+                /*
+                最多摘 8 个：本机可写电流节点里带 input_current_limit 的有两个
+                （mt6375 的 chg/input_current_limit 和 mtk-master-charger/input_current_limit），
+                内核取两者最小值生效，只摘一个等于没摘
+                */
+                char *saved_ptr[8]={0};
+                int saved_idx[8]={0};
+                int saved_n=0,i=0,write_ret=0;
+                static int last_boost=0;
+                static time_t boost_written_at=0;
+                time_t now_boost=time(NULL);
+                if(boost > 0 && current_change && current_max_file != NULL)
+                {
+                    for(i=0;i<current_max_file_num && saved_n < 8;i++)
+                    {
+                        if(current_max_file[i] != NULL && strstr(current_max_file[i], "input_current_limit"))
+                        {
+                            saved_idx[saved_n]=i;
+                            saved_ptr[saved_n]=current_max_file[i];
+                            current_max_file[i]=NULL;
+                            saved_n++;
+                        }
+                    }
+                }
+                //向电流文件中写入本轮允许的最大充电电流
+                //返回0表示节点当前值已等于目标（快充满时系统自己降到同一个值），不需要告警
+                if(current_change) write_ret=set_current_array(current_max_file, current_max_unit, current_max_file_num, applied_current);
+                for(i=0;i<saved_n;i++) current_max_file[saved_idx[i]]=saved_ptr[i];
+                if(current_change && write_ret < 0 && should_log())
+                    printf_with_time("本轮未能写入任何电流节点（共%d个），节点可能已被系统独占，稍后重试", current_max_file_num);
+                /*
+                值变化时立即写；此外每 30 秒补写一次。
+                补写是必需的：拔插充电器会让系统把该节点重置为协商值，
+                只靠"值变化"判断的话重插之后本项就永久失效了
+                */
+                if(boost > 0 && (boost != last_boost || (now_boost-boost_written_at) >= 30))
+                {
+                    /*
+                    写全部被摘下来的 input_current_limit 节点，而不是只写 mtk-master-charger
+                    内核取这些节点的最小值生效，只写一个，另一个仍会卡在协商值上
+                    */
+                    char boost_buf[24]={0};
+                    char boost_path[96]="/sys/class/power_supply/mtk-master-charger/input_current_limit";
+                    int ok_n=0;
+                    snprintf(boost_buf, sizeof(boost_buf), "%d", boost);
+                    for(i=0;i<saved_n;i++)
+                    {
+                        if(set_value(saved_ptr[i], boost_buf) > 0) ok_n++;
+                    }
+                    //一个都没摘到（例如节点表里只有 constant_charge_current）时退回固定路径
+                    if(saved_n == 0 && set_value(boost_path, boost_buf) > 0) ok_n=1;
+                    if(ok_n > 0)
+                    {
+                        if(boost != last_boost)
+                            printf_with_time("输入限流已设为%dμA（INPUT_CURRENT_BOOST），共写入%d个节点，请观察接下来1分钟的 icl_a / icl_max_a / vin_v 是否触发更高电压档", boost, ok_n);
+                        last_boost=boost;
+                        boost_written_at=now_boost;
+                    }
+                    else if(should_log()) printf_with_time("输入限流写入失败，节点可能不存在或只读，INPUT_CURRENT_BOOST 本轮未生效");
+                }
+                else if(boost <= 0) last_boost=0;
+            }
             charge_log_sample(atoi(power), charge, applied_current, stage_name, temp_sensor);
         }
         //如果手机未在充电，则只会刷新显示温度，以及若执行了获取前台应用包名的子线程，则取消此子线程

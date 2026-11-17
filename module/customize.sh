@@ -212,13 +212,28 @@ on_install()
         fi
         # v79 新增的配置项：老配置里没有，缺项时程序会用默认值，
         # 但仍然补写进配置文件，用户才能看见并自己调整
-        for _k in "CRITICAL_RECOVER=54" "SOFT_START_TEMP=50" "SOFT_START_CURRENT=4000000" "SOFT_START_RECOVER=48" "SOFT_START_TIMEOUT=360"; do
+        for _k in "CRITICAL_RECOVER=53" "CRITICAL_HOLD=180" "SOFT_START_TEMP=0" "SOFT_START_CURRENT=4000000" "SOFT_START_RECOVER=48" "SOFT_START_TIMEOUT=360" "INPUT_CURRENT_BOOST=0"; do
             _kname="${_k%%=*}"
             if ! grep -q "^${_kname}=" ${TMPDIR}/option.txt; then
                 echo "${_k}" >> ${TMPDIR}/option.txt
                 ui_print "  - 新增配置项 ${_k}"
             fi
         done
+        # v80：临界解除 54→53，并新增最短保持时间。
+        # 实测 54℃ 正好落在温度读数 ±1.5℃ 的抖动带上，读到 54.5℃ 后 20 秒就掉到 53.0℃，
+        # 临界只保持 3.5 分钟就放回 6A，随后温度立刻回升，等于白降了一次
+        _old_cr=$(grep "^CRITICAL_RECOVER=" /data/adb/turbo-charge/option.txt | sed "s/^CRITICAL_RECOVER=//g")
+        if [[ "${_old_cr}" == "54" ]]; then
+            sed -i "s/^CRITICAL_RECOVER=.*/CRITICAL_RECOVER=53/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的CRITICAL_RECOVER=54℃落在温度抖动带内，已下调到53℃"
+        fi
+        # v80：软启动实测无收益，默认关闭。
+        # 插线瞬间电流本身从1.2A自然爬升，4A限流前20秒不起作用，真正生效只有65秒
+        _old_sst=$(grep "^SOFT_START_TEMP=" /data/adb/turbo-charge/option.txt | sed "s/^SOFT_START_TEMP=//g")
+        if [[ "${_old_sst}" == "50" ]]; then
+            sed -i "s/^SOFT_START_TEMP=.*/SOFT_START_TEMP=0/g" ${TMPDIR}/option.txt
+            ui_print "  - 高温软启动实测无收益（只延后90秒且少充0.5个点），已关闭（SOFT_START_TEMP=0）"
+        fi
     else
         ui_print " 旧配置文件不存在，使用默认配置"
         ui_print "  - 添加温控，当温度高于58℃时限制最高充电电流为6A，低于50℃时恢复"
