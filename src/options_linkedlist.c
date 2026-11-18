@@ -37,7 +37,13 @@ void insert_all_option()
     insert_option("CHARGE_STOP", 95);
     insert_option("CHARGE_START", 80);
     insert_option("TEMP_MAX", 58);
-    insert_option("HIGHEST_TEMP_CURRENT", 6000000);
+    /*
+    1级限流的电流上限（单位:μA），7000000=7A
+    v80 实测两条边界：8A 时电池升温 +0.84℃/分，6A 时降温 -0.21℃/分，
+    线性外推热平衡电流约 6.4A；7A 的平衡温度约 54℃，输出约 29.5W，
+    这是"稳定30W"在本机散热条件下唯一能长时间站住的档位
+    */
+    insert_option("HIGHEST_TEMP_CURRENT", 7000000);
     insert_option("RECHARGE_TEMP", 50);
     insert_option("BYPASS_CHARGE", 0);
     //智能分段充电：按电量分档限制电流，让降速发生在高电量段
@@ -46,10 +52,15 @@ void insert_all_option()
     insert_option("STAGE_START", 80);
     //智能分段模式下的满速基准电流（单位:μA），8000000=8A
     insert_option("PEAK_CURRENT", 8000000);
-    //真实温度熔断阈值（单位:℃），用电池自身温度判断，不受强制显示28℃影响
+    //1级限流阈值（单位:℃），用电池自身温度判断，不受强制显示28℃影响
     insert_option("FORCE_TEMP_MAX", 52);
-    //熔断解除阈值（单位:℃），必须低于FORCE_TEMP_MAX才有滞回，否则温度抖1℃就反复开关熔断
-    insert_option("GUARD_RECOVER", 46);
+    /*
+    1级解除阈值（单位:℃）
+    v80 实测：8A 把电池推到52℃用了8.5分钟，降6A后5分钟就回落到48.3℃，
+    此后整段停在46~49℃。旧值46℃意味着要等跌到46才放开，结果一口气锁了24分钟。
+    49℃让温度一离开 52℃ 的峰值带就交回 8A，与 2级阈值(55℃)之间留足间隔
+    */
+    insert_option("GUARD_RECOVER", 49);
     /*
     熔断时是否把真实温度交还给系统（0=不交还，1=交还）
     默认0：本机实测，系统看到46℃以上的真实电池温度后会对充电器做开/关硬切断，
@@ -78,7 +89,7 @@ void insert_all_option()
     v79实测：54℃解除时，05:52:23读到54.5℃、20秒后读到53.0℃就退出了，
     而温度读数本身有±1.5℃抖动，54℃这个门限刚好落在抖动带上
     */
-    insert_option("CRITICAL_RECOVER", 53);
+    insert_option("CRITICAL_RECOVER", 54);
     /*
     临界降流的最短保持时间（单位:秒）
     v79实测：临界 05:48:59 触发、05:52:34 就解除，只保持了3.5分钟，
@@ -108,6 +119,21 @@ void insert_all_option()
     充电时间被无谓拉长。到点后交回熔断/分段策略，该降的温度已经降过了
     */
     insert_option("SOFT_START_TIMEOUT", 360);
+    /*
+    2级限流：温度继续上升时从7A再降一档
+    v80 实测 7A 的平衡温度约 54℃，已经贴近 3级阈值，
+    留给它的任务不是长期稳定，而是防止在逆光/高温环境（比如车里、太阳直射）
+    里一直卡在1级时温度缓慢爬过 55℃ 而无人处理
+    */
+    insert_option("GUARD2_TEMP", 55);
+    //2级限流的电流上限（单位:μA），6000000=6A，约25W
+    insert_option("GUARD2_CURRENT", 6000000);
+    /*
+    2级解除阈值（单位:℃）
+    跌破 52℃ 回到1级（7A），与 1级 52进/49出 交叉，形成 2℃ 的稳定带：
+    温度落在 52~55℃ 之间时停在1级，既不会整段放开到 8A，也不会掉回 6A
+    */
+    insert_option("GUARD2_RECOVER", 52);
     /*
     输入限流提升实验开关（单位:μA，0=关闭）
     v79实测的功率天花板不在电池侧而在输入侧：

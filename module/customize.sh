@@ -234,6 +234,35 @@ on_install()
             sed -i "s/^SOFT_START_TEMP=.*/SOFT_START_TEMP=0/g" ${TMPDIR}/option.txt
             ui_print "  - 高温软启动实测无收益（只延后90秒且少充0.5个点），已关闭（SOFT_START_TEMP=0）"
         fi
+        # v81：二段熔断改为三级梯度，目标是中段（33%~80%）贴近 30W。
+        # v80 实测 8A 只能站 8.5 分钟，而降 6A 后温度 5 分钟就回到 48.3℃，
+        # 却因为解除阈值是 46℃ 一直锁在 6A 长达 24 分钟。7A 的热平衡温度约 54℃、
+        # 输出约 29.5W，是能长时间站住的最高档位，所以 1级限流值提到 7A
+        # 这里一律读 TMPDIR 里的当前值，而不是原始文件的旧值：
+        # 上面的兼容块可能刚把 46/6000000 写进去，用旧值判断会漏掉这批用户
+        _cur_gr=$(grep "^GUARD_RECOVER=" ${TMPDIR}/option.txt | sed "s/^GUARD_RECOVER=//g")
+        _cur_htc=$(grep "^HIGHEST_TEMP_CURRENT=" ${TMPDIR}/option.txt | sed "s/^HIGHEST_TEMP_CURRENT=//g")
+        _cur_cr=$(grep "^CRITICAL_RECOVER=" ${TMPDIR}/option.txt | sed "s/^CRITICAL_RECOVER=//g")
+        if [[ "${_cur_gr}" == "46" ]]; then
+            sed -i "s/^GUARD_RECOVER=.*/GUARD_RECOVER=49/g" ${TMPDIR}/option.txt
+            ui_print "  - 旧的GUARD_RECOVER=46℃会锁住6A长达20分钟以上，已改为49℃（离开峰值带即交回8A）"
+        fi
+        if [[ "${_cur_htc}" == "6000000" ]]; then
+            sed -i "s/^HIGHEST_TEMP_CURRENT=.*/HIGHEST_TEMP_CURRENT=7000000/g" ${TMPDIR}/option.txt
+            ui_print "  - 1级限流由6A提到7A（约29.5W），这是本机散热下能长时间稳定住的最高档位"
+        fi
+        if [[ "${_cur_cr}" == "53" ]]; then
+            sed -i "s/^CRITICAL_RECOVER=.*/CRITICAL_RECOVER=54/g" ${TMPDIR}/option.txt
+            ui_print "  - CRITICAL_RECOVER已随三级梯度调整为54℃"
+        fi
+        # v81 新增的 2级限流项：缺项时程序会用默认值，但补写进配置文件用户才能看见
+        for _k in "GUARD2_TEMP=55" "GUARD2_CURRENT=6000000" "GUARD2_RECOVER=52"; do
+            _kname="${_k%%=*}"
+            if ! grep -q "^${_kname}=" ${TMPDIR}/option.txt; then
+                echo "${_k}" >> ${TMPDIR}/option.txt
+                ui_print "  - 新增配置项 ${_k}"
+            fi
+        done
     else
         ui_print " 旧配置文件不存在，使用默认配置"
         ui_print "  - 添加温控，当温度高于58℃时限制最高充电电流为6A，低于50℃时恢复"
