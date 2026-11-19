@@ -169,7 +169,7 @@ void charge_log_close(void)
 void charge_log_sample(int capacity, const char *status, int applied_current, const char *stage, const char *temp_sensor)
 {
     struct stat statbuf={0};
-    struct tm time_now;
+    struct tm time_now={0};
     time_t now=time(NULL);
     char time_str[32]={0};
     char sensor_str[16]={0};
@@ -222,8 +222,17 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     }
     last_write_time=now;
 
-    localtime_r(&now, &time_now);
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &time_now);
+    /*
+    v84 起与 log.txt 统一用北京时间
+    原来这里用 localtime_r，但本模块是静态链接的 musl 二进制，目标机上既没有 tzdata 也没有 TZ
+    环境变量，localtime_r 会静默退回 UTC —— 实测整份 CSV 比 log.txt 慢整 8 小时，
+    同一时刻在两边对不上，排查时很容易误判成"这段没记进 CSV"
+    改成复用 printf_with_time 里那套 gmtime+8h 的换算，跨月跨年进位也一并复用
+    */
+    get_utc8_time(&time_now);
+    snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d",
+             time_now.tm_year, time_now.tm_mon, time_now.tm_mday,
+             time_now.tm_hour, time_now.tm_min, time_now.tm_sec);
 
     fprintf(log_fp, "%s,%d,%s,", time_str, capacity, (status != NULL && status[0])?status:"NA");
     //充电类型与电池健康度：Fast/Trickle/Standard 能直接看出内核是否已经降到涓流，

@@ -731,6 +731,19 @@ static void temp_tier_step(int tenth, const int *enter, const int *exitc, int ho
     }
 }
 
+/*
+拔线时把梯度状态清零
+不清零的话档位会带到下一次插线：v83 实测 17:32 拔线时停在2级，19:46 插线后
+在同一秒里连打两条日志（2级→1级、1级→解除），并且首秒仍按7A写入，
+要等下一轮循环才回到8A —— 用户看到的就是"插上先降档再放开"这种莫名其妙的动作
+插线后的真实温度由下一轮 temp_tier_step 重新判定，所以清零不会漏掉高温保护
+*/
+static void temp_tier_reset(void)
+{
+    temp_tier=0;
+    tier_high_since=0;
+}
+
 int main()
 {
     char *temp_sensor = NULL,**current_limit_file = NULL,**current_max_file = NULL,**temp_file = NULL;
@@ -1296,6 +1309,8 @@ int main()
             {
                 printf_with_time("充电器断开连接");
                 last_charge_status=0;
+                //上一次充电遗留的温度梯度档位不能带进下一次插线，见 temp_tier_reset 的说明
+                temp_tier_reset();
             }
             //通过判断子线程是否仍在运行来决定是否需要取消它，若在运行则取消并清空ForegroundAppName
             pthread_mutex_lock((pthread_mutex_t *)&mutex_foreground_app);
