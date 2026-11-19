@@ -809,7 +809,7 @@ int main()
         {
             int boost_show=read_one_option("INPUT_CURRENT_BOOST");
             if(boost_show > 0)
-                printf_with_time("警告：输入限流提升实验已开启，input_current_limit 固定写为%dμA。若充电器不支持更高电压档，可能出现掉到5V慢充，请在本轮充电中确认 icl_a/vin_v 是否正常；不需要时把 INPUT_CURRENT_BOOST 改回0", boost_show);
+                printf_with_time("警告：输入限流提升实验已开启，input_current_limit 固定写为%dμA。若充电器不支持更高电压档，可能出现掉到5V慢充，请在本轮充电中确认 pbat_w 与 icl_a 是否正常；不需要时把 INPUT_CURRENT_BOOST 改回0", boost_show);
         }
         {
             int soft_on_show=read_one_option("SOFT_START_TEMP");
@@ -1272,7 +1272,7 @@ int main()
                     if(ok_n > 0)
                     {
                         if(boost != last_boost)
-                            printf_with_time("输入限流已设为%dμA（INPUT_CURRENT_BOOST），共写入%d个节点，请观察接下来1分钟的 icl_a / icl_max_a / vin_v 是否触发更高电压档", boost, ok_n);
+                            printf_with_time("输入限流已设为%dμA（INPUT_CURRENT_BOOST），共写入%d个节点，请观察接下来1分钟的 pbat_w 与 icl_a 是否有变化", boost, ok_n);
                         last_boost=boost;
                         boost_written_at=now_boost;
                     }
