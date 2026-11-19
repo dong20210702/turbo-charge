@@ -263,11 +263,12 @@ on_install()
                 ui_print "  - 新增配置项 ${_k}"
             fi
         done
+        ui_print "  - 采样日志格式已变更（删除 vin_v/icl_max_a/icl_bat_a 三列），旧的 charge_log.csv 会自动改名为 charge_log.old.csv"
     else
         ui_print " 旧配置文件不存在，使用默认配置"
-        ui_print "  - 添加温控，当温度高于58℃时限制最高充电电流为6A，低于50℃时恢复"
+        ui_print "  - 采用三级温度梯度：52℃降到7A、55℃降到6A、57℃降到4.5A，温度回落时逐级放开"
         ui_print "  - 不添加电量控制"
-        ui_print "  - 不关闭阶梯式充电"
+        ui_print "  - 关闭阶梯式充电（STEP_CHARGING_DISABLED=1），避免系统提前降流"
         ui_print "  - 启用强制显示28℃功能"
         ui_print "  - 禁用“伪”旁路供电功能"
     fi

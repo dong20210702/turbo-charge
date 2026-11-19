@@ -775,10 +775,6 @@ int main()
     pthread_create(&thread2, NULL, &read_option_file, (void *)&read_option_time);
     pthread_detach(thread2);
     load_current_config(current_max_char, 20, highest_temp_current_char, 20);
-    //老用户的option.txt里没有新配置项，升级后SMART_CHARGE会用默认值1，
-    //但STEP_CHARGING_DISABLED仍然是他们原来的0，此时系统会提前降流，需要明确提示
-    if(read_one_option("SMART_CHARGE") == 1 && read_one_option("STEP_CHARGING_DISABLED") != 1)
-        printf_with_time("提示：智能分段充电已启用，但阶梯式充电仍处于开启状态，系统会在电量过半后自行降流，建议把option.txt中的STEP_CHARGING_DISABLED改为1");
     printf_with_time("充电采样日志：/data/adb/turbo-charge/charge_log.csv（充电中每5秒一行）");
     /*
     启动时把当前生效的温控策略打印出来
@@ -793,6 +789,15 @@ int main()
         int wait_ms=0;
         while(!option_load_ready && wait_ms < 2000) { usleep(20000); wait_ms+=20; }
         if(!option_load_ready) printf_with_time("警告：配置文件读取超时，以下策略为本次使用的值，可能尚未与option.txt同步");
+        /*
+        这条提示必须带上 step_charge 判断
+        v81实测：本机没有 battery/step_charging_enabled 文件（启动时已明确报过"阶梯式充电控制的所有功能失效"），
+        但这段提示只看配置项，于是出现了自相矛盾的日志——
+        一边说阶梯充电功能失效，一边建议你把它关掉。功能本来就不存在，关不关都一样
+        step_charge==0 表示本机不支持，此时直接跳过提示
+        */
+        if(step_charge != 0 && read_one_option("SMART_CHARGE") == 1 && read_one_option("STEP_CHARGING_DISABLED") != 1)
+            printf_with_time("提示：智能分段充电已启用，但阶梯式充电仍处于开启状态，系统会在电量过半后自行降流，建议把option.txt中的STEP_CHARGING_DISABLED改为1");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
         printf_with_time("温度梯度：1级%d℃降为%dμA（%d℃解除） / 2级%d℃降为%dμA（%d℃回1级） / 3级%d℃降为%dμA（%d℃回2级，至少保持%d秒）",
@@ -1058,11 +1063,17 @@ int main()
                             temp_tier_step(real_tenth_inner, enter_th_inner, exit_th_inner, crit_hold_inner);
                             if(temp_tier != was_tier_inner)
                             {
-                                if(temp_tier > 0)
-                                    printf_with_time("电池温度%.1f℃切换到%d级限流，电流%dμA",
-                                                     (double)real_tenth_inner/10.0, temp_tier, temp_tier_current(temp_tier));
-                                else printf_with_time("电池温度%.1f℃已跌破%d℃，解除温度梯度，恢复分段电流%sμA",
-                                                      (double)real_tenth_inner/10.0, exit_th_inner[1], current_max_char);
+                                //与外层同一套规则：升档和降档分开写，避免"低温却写着按高温阈值进档"
+                                int rose_inner=(temp_tier > was_tier_inner);
+                                if(temp_tier == 0)
+                                    printf_with_time("电池温度%.1f℃已跌破%d℃，解除温度梯度，恢复分段电流%sμA",
+                                                     (double)real_tenth_inner/10.0, exit_th_inner[1], current_max_char);
+                                else if(!rose_inner)
+                                    printf_with_time("电池温度%.1f℃已跌破%d℃，由%d级降到%d级，电流放开到%dμA",
+                                                     (double)real_tenth_inner/10.0, exit_th_inner[was_tier_inner], was_tier_inner,
+                                                     temp_tier, temp_tier_current(temp_tier));
+                                else printf_with_time("电池温度%.1f℃升到%d级限流，电流%dμA",
+                                                      (double)real_tenth_inner/10.0, temp_tier, temp_tier_current(temp_tier));
                             }
                             if(temp_tier > 0)
                             {
@@ -1146,9 +1157,19 @@ int main()
                     }
                     if(temp_tier != was_tier)
                     {
+                        /*
+                        必须区分升档和降档
+                        v81实测日志里出现过"电池温度51.5℃进入2级限流（≥55℃）"这种自相矛盾的记录：
+                        温度只有51.5℃，却写着按55℃阈值进档。实际是温度回落后逐级下移，
+                        逻辑没错，但文案让人误读成升温跳档，排查时会往完全错误的方向找
+                        */
+                        int rose=(temp_tier > was_tier);
                         if(temp_tier == 0)
                             printf_with_time("电池温度%.1f℃已跌破%d℃，解除温度梯度，恢复分段电流%dμA",
                                              (double)tenth_for_tier/10.0, exit_th[1], applied_current);
+                        else if(!rose)
+                            printf_with_time("电池温度%.1f℃已跌破%d℃，由%d级降到%d级，电流放开到%dμA",
+                                             (double)tenth_for_tier/10.0, exit_th[was_tier], was_tier, temp_tier, applied_current);
                         else if(temp_tier == 1)
                             printf_with_time("电池温度%.1f℃进入1级限流（≥%d℃），电流限制为%dμA，跌破%d℃解除",
                                              (double)tenth_for_tier/10.0, enter_th[0], applied_current, exit_th[1]);

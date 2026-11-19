@@ -46,7 +46,7 @@ adb pull /data/adb/turbo-charge/charge_log.csv
 ```
 充电中每5秒一行，重点看四列：
 - `tsensor_c` 温度传感器原始读数（模块改不到的那个）。`tbat_c` 是被伪造成 28.0 的那一列，只能当参考
-- `vusb_v` / `ibus_max_a` 充电器实际协商到的电压与电流上限。想看“67W 套件有没有被识别”就看这里，卡在 5V 说明只走了普通协议
+- `vusb_v` / `ibus_max_a` 充电器侧电压与电流上限。多数 MTK 机型这两个节点不暴露真实 VBUS（恒为 NA 或 0.00），此时判断"67W 套件有没有被识别"只能看 `pbat_w` 能否长时间超过 25W
 - `ccc_max_a` / `ccc_a` 内核实际接受的恒流上限和实际恒流值。模块写进去又被系统改回去，这里会立刻露出来
 - `applied_a` / `stage` 模块本轮写入的电流与所处档位（`0-80`、`80-90`、`TEMP-GUARD`(7A)、`TEMP-GUARD2`(6A)、`TEMP-CRIT`(4.5A) 等）
 

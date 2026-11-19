@@ -4,7 +4,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <sys/stat.h>
 
 #include "charge_log.h"
@@ -18,6 +17,20 @@
 #define CHARGE_LOG_INTERVAL_IDLE       30
 //超过4MB就轮转，避免长时间挂机把分区写满
 #define CHARGE_LOG_MAX_SIZE            (4*1024*1024)
+/*
+表头集中成一处，除了写入还要用于"旧文件列结构是否一致"的比对
+v82 删掉了 vin_v / icl_max_a / icl_bat_a 三列（本机永久 NA），
+列数变了而日志是追加写的，旧文件不改名就会让新数据整体左移三列
+*/
+#define CHARGE_LOG_HEADER \
+    "time,cap_pct,status,chg_type,health," \
+    "vbat_v,ibat_a,pbat_w," \
+    "tbat_c,tbat_raw,tsensor_c," \
+    "vusb_v,iusb_a,usb_online,vbus_max_v,ibus_max_a," \
+    "ccc_max_a,ccc_a,icl_limited,icl_a," \
+    "chg_full_mah,chg_design_mah,cycles," \
+    "tcpu_c," \
+    "applied_a,stage"
 
 static FILE *log_fp = NULL;
 static time_t last_write_time = 0;
@@ -90,14 +103,11 @@ static void put_text(FILE *fp, const char *path)
 }
 
 /*
-探测输入限流(ICL)与输入电压节点
-这两项是判断"功率天花板在哪"的核心：
-  icl_a       内核此刻真正允许的输入电流。模块写进去的是8A，但MTK的AICL会按
-              充电器/线材实际能力把它压回去，压到多少只有读这个节点才知道
-  icl_max_a   内核认定的限流上限。与 icl_a 相等说明已打满、充电器到顶；
-              远大于 icl_a 说明是系统自己在压
-  icl_bat_a   battery/input_current_limit 的实际值，即模块写进去的那个节点
-  vin_v       充电器实际协商到的电压。9V档×3.2A=29W，正好卡在"峰值30W上不去"
+探测输入限流(ICL)节点
+说明：本机（红米22041211AC / 天玑8100）不暴露 VBUS 电压，也不存在 input_current_limit_max，
+      v80 曾据此反推出"9V×3.225A=29W 输入上限"，但下一轮实测输出就到 34.5W——
+      icl_a 是静态寄存器读数，不能用来反推输入功率。所以输入侧只保留 icl_a 一列，
+      它仍能反映"模块写进去的电流有没有被内核改回去"
 机型不同节点名不同，所以按候选表逐个试，第一次探测成功后缓存路径，避免每5秒扫一遍
 */
 static const char *icl_candidates[]={
@@ -107,43 +117,7 @@ static const char *icl_candidates[]={
     "/sys/class/power_supply/charger/input_current_limit",
     NULL
 };
-static const char *vin_candidates[]={
-    "/sys/class/power_supply/mtk-master-charger/voltage_now",
-    "/sys/class/power_supply/charger/voltage_now",
-    "/sys/class/power_supply/usb/voltage_now",
-    NULL
-};
 static const char *icl_path = NULL;
-static const char *vin_path = NULL;
-/*
-扫到的真实输入电压节点
-候选表在MTK上经常全部落空：mtk-master-charger没有voltage_now，
-usb/voltage_now报的是10mV这种无效差值。与其继续猜节点名，
-不如直接把power_supply下每个节点的voltage_now都读一遍，
-取3.5V~30V区间里的最大值——电池电压被排除，剩下的最大值必然是充电器输入
-*/
-static char vin_scan_path[192]={0};
-static int vin_scanned=0;
-
-/*
-判断 power_supply 下的节点是否属于电池侧
-v79 的教训：bms/voltage_now 与 battery/voltage_now 同源，报的就是电池电压。
-上一版扫描时 bms 是唯一通过 3.5V 下限的候选，vin_v 列于是变成了 vbat 的副本，
-与 vbat 逐行完全相等（3.65/4.17/4.20…4.46）。这比记 NA 更糟：
-NA 至少说明"读不到"，而假数据会让人以为输入电压已经采到了
-判定顺序：节点名 → type 文件 → 名字兜底，任一命中即判为电池侧
-*/
-static int is_battery_side(const char *name)
-{
-    char path[192]={0};
-    char type[48]={0};
-    if(name == NULL) return 1;
-    if(!strncmp(name, "battery", 7) || !strncmp(name, "bms", 3)) return 1;
-    snprintf(path, sizeof(path), "/sys/class/power_supply/%s/type", name);
-    if(!raw_read(path, type, sizeof(type))) return (strstr(name, "batt") != NULL);
-    if(strstr(type, "Battery") || strstr(type, "bms") || strstr(type, "batt")) return 1;
-    return 0;
-}
 
 static const char *pick_current_node(const char **candidates, long min_value)
 {
@@ -154,20 +128,6 @@ static const char *pick_current_node(const char **candidates, long min_value)
         if(read_long(candidates[i], &value) && value >= min_value) return candidates[i];
     }
     return NULL;
-}
-
-//电流类节点的通用输出：单位可能是μA也可能是mA，按量级判定后统一换算成A
-static void put_current_auto(FILE *fp, const char *path)
-{
-    long value=0;
-    char buf[32]={0};
-    if(path == NULL) { fputs("NA", fp); return; }
-    if(!raw_read(path, buf, sizeof(buf))) { fputs("NA", fp); return; }
-    value=strtol(buf, NULL, 10);
-    if(value <= 0) { fputs("NA", fp); return; }
-    //<=30000 只可能是mA制（30A以上的μA值不现实），其余按μA处理
-    if(value <= 30000) fprintf(fp, "%.3f", (double)value/1000.0);
-    else fprintf(fp, "%.3f", (double)value/1e6);
 }
 
 //输入电流，单位可能是μA也可能是mA，按量级判定后统一换算成A
@@ -183,104 +143,6 @@ static void put_icl(FILE *fp)
     //<=30000 只可能是mA制（30A以上的μA值不现实），其余按μA处理
     if(value <= 30000) fprintf(fp, "%.3f", (double)value/1000.0);
     else fprintf(fp, "%.3f", (double)value/1e6);
-}
-
-/*
-遍历 /sys/class/power_supply 下所有节点，挑出真正的充电器输入电压
-输入电压的正常量级是 5V/9V/11V/20V（μV制即 5000000 起），
-所以区间取 3.5V~30V：低于3.5V只可能是无效读数或单节电芯电压，
-高于30V不可能是USB PD档位
-两道排除，缺一不可：
-  ① 电池侧节点（bms / battery / type=Battery）直接跳过
-  ② 与 vbat 相差小于 0.4V 的候选跳过 —— 5V 是最低的 USB 输入档，
-     与 4.4V 电池至少差 0.6V，落在 0.4V 以内只可能是电池电压的另一个镜像节点
-扫描结果只打一次日志，并把每个候选的电压与排除原因一并列出，方便定位本机真实节点
-*/
-static void scan_voltage_nodes(void)
-{
-    DIR *dir=NULL;
-    struct dirent *ent=NULL;
-    char path[192]={0};
-    char list[1024]={0};
-    long value=0,best=0,vbat_uv=0;
-    int n=0,has_vbat=0;
-    vin_scanned=1;
-    vin_scan_path[0]='\0';
-    has_vbat=read_long("/sys/class/power_supply/battery/voltage_now", &vbat_uv) && vbat_uv > 0;
-    dir=opendir("/sys/class/power_supply");
-    if(dir == NULL) return;
-    while((ent=readdir(dir)) != NULL)
-    {
-        int batt_side=0,near_vbat=0;
-        if(ent->d_name[0] == '.') continue;
-        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/voltage_now", ent->d_name);
-        if(!read_long(path, &value)) continue;
-        batt_side=is_battery_side(ent->d_name);
-        near_vbat=(!batt_side && has_vbat && value > vbat_uv-400000 && value < vbat_uv+400000);
-        n=(int)strlen(list);
-        if(n < (int)sizeof(list)-64)
-        {
-            if(batt_side)
-                snprintf(list+n, sizeof(list)-n, "%s=%.2fV[电池侧] ", ent->d_name, (double)value/1e6);
-            else if(near_vbat)
-                snprintf(list+n, sizeof(list)-n, "%s=%.2fV[≈vbat] ", ent->d_name, (double)value/1e6);
-            else
-                snprintf(list+n, sizeof(list)-n, "%s=%.2fV ", ent->d_name, (double)value/1e6);
-        }
-        if(batt_side || near_vbat) continue;
-        if(value >= 3500000 && value <= 30000000 && value > best)
-        {
-            best=value;
-            snprintf(vin_scan_path, sizeof(vin_scan_path), "%s", path);
-        }
-    }
-    closedir(dir);
-    if(vin_scan_path[0] != '\0')
-        printf_with_time("输入电压节点：%s（扫描到 %s）", vin_scan_path, (list[0] != '\0')?list:"无其他节点");
-    else
-        printf_with_time("警告：power_supply 下找不到可用的输入电压节点，vin_v 列将记为NA（扫描到 %s）", (list[0] != '\0')?list:"无");
-}
-
-static void put_vin(FILE *fp, int charging)
-{
-    long value=0,vbat_uv=0;
-    int has_vbat=0;
-    /*
-    每次插上充电器都重新扫一遍：拔插后 power_supply 下的节点可能重新注册，
-    指针或读数都会失效。只在充电边沿重置，充电过程中不重扫，避免刷日志
-    */
-    static int last_charging=0;
-    if(charging && !last_charging) { vin_scanned=0; vin_path=NULL; }
-    last_charging=charging;
-    /*
-    不充电时直接记NA：未插充电器时 power_supply 下本来就没有输入电压，
-    部分机型还会把最后的读数留在节点里，读出来就是一个假的输入电压
-    */
-    if(!charging) { fputs("NA", fp); return; }
-    if(!vin_scanned) scan_voltage_nodes();
-    if(vin_scan_path[0] != '\0')
-    {
-        has_vbat=read_long("/sys/class/power_supply/battery/voltage_now", &vbat_uv) && vbat_uv > 0;
-        if(read_long(vin_scan_path, &value) && value >= 3500000 && value <= 30000000
-           && !(has_vbat && value > vbat_uv-400000 && value < vbat_uv+400000))
-        {
-            fprintf(fp, "%.2f", (double)value/1e6);
-            return;
-        }
-        //读到无效值（低于3.5V或与电池电压接近）时清掉缓存并记NA
-        //这里不重置 vin_scanned：重置会让下一轮立刻重扫，而扫描本身会打日志，
-        //若该节点长期读数异常就会每5秒刷一条"输入电压节点"，反而盖住真正有用的信息
-        vin_scan_path[0]='\0';
-        fputs("NA", fp);
-        return;
-    }
-    //扫描落空时才退回候选表，同样排除与电池电压接近的读数
-    has_vbat=read_long("/sys/class/power_supply/battery/voltage_now", &vbat_uv) && vbat_uv > 0;
-    if(vin_path == NULL) vin_path=pick_current_node(vin_candidates, 3500000);
-    if(vin_path == NULL) { fputs("NA", fp); return; }
-    if(!read_long(vin_path, &value) || value < 3500000 || value > 30000000
-       || (has_vbat && value > vbat_uv-400000 && value < vbat_uv+400000)) { vin_path=NULL; fputs("NA", fp); return; }
-    fprintf(fp, "%.2f", (double)value/1e6);
 }
 
 void charge_log_init(void)
@@ -330,20 +192,33 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     if(log_fp == NULL)
     {
         int need_header=1;
-        if(!stat(CHARGE_LOG_FILE, &statbuf) && statbuf.st_size > 0) need_header=0;
+        if(!stat(CHARGE_LOG_FILE, &statbuf) && statbuf.st_size > 0)
+        {
+            /*
+            旧文件的表头必须与新代码完全一致才能继续追加
+            列数变动过（v82 删了 vin_v / icl_max_a / icl_bat_a），
+            直接在旧文件后面追加会让每一行少三列，用列名读的脚本会把 stage 之类读成 NA，
+            用列号读的脚本会整体错位。不一致就改名归档，重新起一份
+            */
+            char head[320]={0};
+            FILE *check=fopen(CHARGE_LOG_FILE, "r");
+            int same=0;
+            if(check != NULL)
+            {
+                if(fgets(head, sizeof(head), check) != NULL)
+                {
+                    int len=(int)strlen(head);
+                    while(len > 0 && (head[len-1]=='\n' || head[len-1]=='\r')) head[--len]='\0';
+                    same=(!strcmp(head, CHARGE_LOG_HEADER));
+                }
+                fclose(check);
+            }
+            if(same) need_header=0;
+            else rename(CHARGE_LOG_FILE, CHARGE_LOG_OLD_FILE);
+        }
         log_fp=fopen(CHARGE_LOG_FILE, "a");
         if(log_fp == NULL) return;
-        if(need_header)
-        {
-            fputs("time,cap_pct,status,chg_type,health,"
-                  "vbat_v,ibat_a,pbat_w,"
-                  "tbat_c,tbat_raw,tsensor_c,"
-                  "vusb_v,iusb_a,usb_online,vbus_max_v,ibus_max_a,"
-                  "ccc_max_a,ccc_a,icl_limited,icl_a,icl_max_a,icl_bat_a,vin_v,"
-                  "chg_full_mah,chg_design_mah,cycles,"
-                  "tcpu_c,"
-                  "applied_a,stage\n", log_fp);
-        }
+        if(need_header) fprintf(log_fp, "%s\n", CHARGE_LOG_HEADER);
     }
     last_write_time=now;
 
@@ -411,11 +286,12 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     else fputs("NA", log_fp);
     fputc(',', log_fp);
 
-    //充电器侧：能否看到9V/20V协商结果，是判断"67W套件有没有被识别"的关键
+    //充电器侧电压：本机（天玑8100）该节点整轮报 0.01V，实际价值有限，仅作存在性参考
     /*
     usb/voltage_now 在MTK平台上报的是10mV这种无效差值（日志里整轮恒为0.01），
-    直接把原始值写进来会把"读不到"伪装成"读到了0.01V"，比NA更误导。
-    低于3.5V一律记NA；真正的输入电压看后面的 vin_v 列，那一列会自动扫描可用节点
+    直接把原始值写进来会把"读不到"伪装成"读到了0.01V"，比NA更误导，所以低于3.5V一律记NA。
+    v82 起不再尝试扫描其他节点：实测 power_supply 下除 battery/bms（电池电压）外全部为 0.00V，
+    这台机器根本没有暴露 VBUS 电压，扫了也只会刷一条"找不到节点"的警告
     */
     {
         long uv=0;
@@ -440,24 +316,19 @@ void charge_log_sample(int capacity, const char *status, int applied_current, co
     fputc(',', log_fp);
     put_long(log_fp, "/sys/class/power_supply/battery/input_current_limited");
     fputc(',', log_fp);
-    //输入限流实际生效值(A)与输入电压(V)：写进去的电流和真正生效的电流往往不是一回事
+    //输入限流实际生效值(A)：写进去的电流和真正生效的电流往往不是一回事
     put_icl(log_fp);
     fputc(',', log_fp);
     /*
-    icl_max_a：内核认定的输入限流上限。与上一列 icl_a 相等，说明 AICL 已经把
-              限流打满、充电器/线材到顶了；远大于 icl_a，说明是系统自己在压
-    icl_bat_a：battery/input_current_limit 的实际值，即模块写入的那个节点的真实状态。
-              与 applied_a 不一致说明写入被内核改写
-    上一轮实测 icl_a 整轮恒为 3.225A、输出峰值 26.7W，按 88% 效率反推输入 8.87V，
-    即适配器工作在 9V 档：9V×3.225A=29W 就是输入侧天花板，输出不可能超过 26W。
-    这两列就是用来确认"3.225A 是充电器给的还是系统压的"，是在 9V 档还是 11V 档
+    v82 删除了 vin_v / icl_max_a / icl_bat_a 三列
+    实测（红米22041211AC / 天玑8100）这台机器根本不暴露 VBUS 电压：
+    遍历 power_supply 下全部 voltage_now，只有 battery 与 bms 报 3.64V（电池侧），
+    其余 mtk-master-charger / mtk-slave-charger / usb / cp_master / cp_slave / div-chg 全部 0.00V；
+    mtk-master-charger/input_current_limit_max 与 battery/input_current_limit 也不存在。
+    三列因此永久为 NA，只是噪音。更关键的是：v80 曾用反推的"9V×3.225A=29W 输入上限"
+    得出"输出到不了 26W"的错误结论，而下一轮实测输出 34.5W——icl_a 是静态寄存器读数，
+    不能用来反推真实输入功率。与其留三列误导，不如删掉
     */
-    put_current_auto(log_fp, "/sys/class/power_supply/mtk-master-charger/input_current_limit_max");
-    fputc(',', log_fp);
-    put_current_auto(log_fp, "/sys/class/power_supply/battery/input_current_limit");
-    fputc(',', log_fp);
-    put_vin(log_fp, (status != NULL && strcmp(status, "Discharging") != 0));
-    fputc(',', log_fp);
 
     //电池健康度：满充容量相对设计容量的比值决定了恒压阶段会提前多久到来
     put_scaled(log_fp, "/sys/class/power_supply/battery/charge_full", 1000.0, 0);
