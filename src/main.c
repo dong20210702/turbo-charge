@@ -653,29 +653,37 @@ v80 实测依据（11-18 早，9%→100%，全程亮屏）：
 线性外推热平衡电流约6.4A（≈27W），7A对应的平衡温度约54℃（≈29.5W）。
 这就是"稳定30W"的现实落点：允许电池停在53~55℃，换接近30W的持续功率。
 
-三级定义（每级各自带解除阈值，只降不升，一次只降一级）：
+四级定义（每级各自带解除阈值，只降不升，一次只降一级）：
   1级 ≥FORCE_TEMP_MAX(52℃) → HIGHEST_TEMP_CURRENT(7A)，跌破 GUARD_RECOVER(49℃) 解除
   2级 ≥GUARD2_TEMP(55℃)    → GUARD2_CURRENT(6A)，跌破 GUARD2_RECOVER(52℃) 回1级
   3级 ≥CRITICAL_TEMP(57℃)  → CRITICAL_CURRENT(4.5A)，跌破 CRITICAL_RECOVER(54℃) 回2级
+  4级 ≥CRITICAL2_TEMP(60℃) → CRITICAL2_CURRENT(2A)，跌破 CRITICAL2_RECOVER(58℃) 回3级
+
+4级是 v85 新增的兜底档：3级(4.5A)原本就是最后一级，实测亮屏重负载时
+电池能在 4.5A 下维持 56~59.5℃ 半小时，此时模块既不能再降流、也不该交还系统
+（交还后系统对充电器做硬开关，v75 实测 59 分钟只涨 10%）。4级给到 2A，
+宁可慢也不让电芯长时间停在 60℃ 附近
 
 为什么每级单独设解除阈值、而不是共用最低那个：
 共用低位阈值时，温度一跌到该值就整段放开到8A，下一分钟又顶回阈值，形成整段横跳。
 分级滞回让温度落在 52~55℃ 时稳定停在1级（7A），既不横跳，也不会掉回8A。
 */
-static int temp_tier=0;           //0=不限流 1=7A档 2=6A档 3=4.5A档
-static time_t tier_high_since=0;  //进入3级的时刻，用于CRITICAL_HOLD最短保持
+static int temp_tier=0;           //0=不限流 1=7A档 2=6A档 3=4.5A档 4=2A档
+static time_t tier_high_since=0;  //进入3级的时刻，3级和4级降档都受CRITICAL_HOLD约束
 
 /*
-把 option.txt 里的六个阈值整理成递增且带滞回的数组
+把 option.txt 里的八个阈值整理成递增且带滞回的数组
 配置写反（比如2级阈值低于1级）时强行修正，否则上一级永远不会单独生效，
 用户只会看到"一直在大电流"或"一直在降流"这两种极端表现，无法从日志看出配错了
 enter[i] 是进入第 i+1 级的温度，exitc[i] 是第 i 级跌破后解除的温度（0.1℃ 制由调用方换算）
+调用方必须准备 enter[4] 与 exitc[5]：enter 只有4个进档阈值，exitc 多一个 exitc[0]（恒0，表示不限流）
 */
 static void temp_tier_thresholds(int *enter, int *exitc)
 {
     int t1=read_one_option("FORCE_TEMP_MAX"), e1=read_one_option("GUARD_RECOVER");
     int t2=read_one_option("GUARD2_TEMP"), e2=read_one_option("GUARD2_RECOVER");
     int t3=read_one_option("CRITICAL_TEMP"), e3=read_one_option("CRITICAL_RECOVER");
+    int t4=read_one_option("CRITICAL2_TEMP"), e4=read_one_option("CRITICAL2_RECOVER");
     if(t1 < 35) t1=35;
     if(e1 >= t1-1) e1=t1-3;
     if(e1 < 30) e1=30;
@@ -686,8 +694,12 @@ static void temp_tier_thresholds(int *enter, int *exitc)
     if(t3 < t2+2) t3=t2+2;
     if(e3 >= t3-1) e3=t3-2;
     if(e3 <= e2) e3=e2+2;
-    enter[0]=t1; enter[1]=t2; enter[2]=t3;
-    exitc[0]=0; exitc[1]=e1; exitc[2]=e2; exitc[3]=e3;
+    //4级同理：进档阈值至少比3级高2℃，解除温度必须高于3级的解除温度且低于自己的阈值
+    if(t4 < t3+2) t4=t3+2;
+    if(e4 >= t4-1) e4=t4-2;
+    if(e4 <= e3) e4=e3+2;
+    enter[0]=t1; enter[1]=t2; enter[2]=t3; enter[3]=t4;
+    exitc[0]=0; exitc[1]=e1; exitc[2]=e2; exitc[3]=e3; exitc[4]=e4;
 }
 
 static int temp_tier_current(int tier)
@@ -696,12 +708,14 @@ static int temp_tier_current(int tier)
     if(tier == 1) v=read_one_option("HIGHEST_TEMP_CURRENT");
     else if(tier == 2) v=read_one_option("GUARD2_CURRENT");
     else if(tier == 3) v=read_one_option("CRITICAL_CURRENT");
+    else if(tier == 4) v=read_one_option("CRITICAL2_CURRENT");
     if(v < 100000) v=100000;
     return v;
 }
 
 static const char *temp_tier_stage(int tier)
 {
+    if(tier == 4) return "TEMP-CRIT2";
     if(tier == 3) return "TEMP-CRIT";
     if(tier == 2) return "TEMP-GUARD2";
     if(tier == 1) return "TEMP-GUARD";
@@ -711,7 +725,7 @@ static const char *temp_tier_stage(int tier)
 /*
 按电池真实温度（0.1℃制）推进梯度状态
 升温方向允许跨级：温度突升时必须一次性到位，逐级爬会漏掉高温
-降温方向一次只降一级，且离开3级要满足最短保持时间：
+降温方向一次只降一级，且离开3级/4级要满足最短保持时间：
   温度读数本身有±1.5℃抖动，v79 实测从57℃跌到54.5℃只用了20秒就放回大电流，
   随后立刻回升到56.3℃，形成 6A/4.5A 周期性横跳，平均功率反而更低
 读不到温度（tenth<=0）时保持原状态，绝不因为读不到就放开大电流
@@ -719,14 +733,20 @@ static const char *temp_tier_stage(int tier)
 static void temp_tier_step(int tenth, const int *enter, const int *exitc, int hold_sec)
 {
     if(tenth <= 0) return;
-    while(temp_tier < 3 && tenth >= enter[temp_tier]*10)
+    while(temp_tier < 4 && tenth >= enter[temp_tier]*10)
     {
         temp_tier++;
-        if(temp_tier == 3) tier_high_since=time(NULL);
+        /*
+        进入3级、4级都要刷新计时：如果只在3级刷新，从4级往3级退时用的是很久以前的时间戳，
+        等于"最短保持"形同虚设 —— 温度刚跌破58℃就放回4.5A，几分钟后又被顶到60℃，
+        在58~60℃ 之间来回跳。逐级刷新才能保证每次离开高温区都实打实等了180秒
+        */
+        if(temp_tier >= 3) tier_high_since=time(NULL);
     }
     if(temp_tier > 0 && tenth <= exitc[temp_tier]*10)
     {
-        if(temp_tier == 3 && hold_sec > 0 && (long)(time(NULL)-tier_high_since) < hold_sec) return;
+        //3级和4级都算高温区，退出前必须先满足最短保持时间，否则会在阈值附近来回跳
+        if(temp_tier >= 3 && hold_sec > 0 && (long)(time(NULL)-tier_high_since) < hold_sec) return;
         temp_tier--;
     }
 }
@@ -813,11 +833,13 @@ int main()
             printf_with_time("提示：智能分段充电已启用，但阶梯式充电仍处于开启状态，系统会在电量过半后自行降流，建议把option.txt中的STEP_CHARGING_DISABLED改为1");
         int guard_on_show=read_one_option("FORCE_TEMP_MAX"), guard_off_show=read_one_option("GUARD_RECOVER");
         int gap=guard_on_show-guard_off_show;
-        printf_with_time("温度梯度：1级%d℃降为%dμA（%d℃解除） / 2级%d℃降为%dμA（%d℃回1级） / 3级%d℃降为%dμA（%d℃回2级，至少保持%d秒）",
+        printf_with_time("温度梯度：1级%d℃降为%dμA（%d℃解除） / 2级%d℃降为%dμA（%d℃回1级） / 3级%d℃降为%dμA（%d℃回2级） / 4级%d℃降为%dμA（%d℃回3级，3级与4级至少保持%d秒）",
                          guard_on_show, read_one_option("HIGHEST_TEMP_CURRENT"), guard_off_show,
                          read_one_option("GUARD2_TEMP"), read_one_option("GUARD2_CURRENT"), read_one_option("GUARD2_RECOVER"),
                          read_one_option("CRITICAL_TEMP"), read_one_option("CRITICAL_CURRENT"),
-                         read_one_option("CRITICAL_RECOVER"), read_one_option("CRITICAL_HOLD"));
+                         read_one_option("CRITICAL_RECOVER"),
+                         read_one_option("CRITICAL2_TEMP"), read_one_option("CRITICAL2_CURRENT"),
+                         read_one_option("CRITICAL2_RECOVER"), read_one_option("CRITICAL_HOLD"));
         printf_with_time("手机温控：%d℃进%d℃出 / 电池温度伪装的熔断上限由1级阈值决定", read_one_option("TEMP_MAX"), read_one_option("RECHARGE_TEMP"));
         {
             int boost_show=read_one_option("INPUT_CURRENT_BOOST");
@@ -1050,7 +1072,7 @@ int main()
                         else if(step_charge == 2) (read_one_option("STEP_CHARGING_DISABLED") == 1)?step_charge_ctl("0"):step_charge_ctl("1");
                         //向电流文件中写入限制电流数值
                         /*
-                        内层温控循环同样要跑完整的三级梯度
+                        内层温控循环同样要跑完整的四级梯度
                         TEMP-CTRL 是二层循环，一旦进去就不再走外层的梯度判断，
                         如果这里只判最高一级，温度落在52~55℃之间时会一直用
                         HIGHEST_TEMP_CURRENT（7A）跑，把温度继续往上顶。
@@ -1065,7 +1087,7 @@ int main()
                             int g2=read_one_option("GUARD2_CURRENT");
                             if(g2 > 0 && (inner_current <= 0 || g2 < inner_current)) inner_current=g2;
                         }
-                        int enter_th_inner[3]={0}, exit_th_inner[4]={0};
+                        int enter_th_inner[4]={0}, exit_th_inner[5]={0};
                         int crit_hold_inner=read_one_option("CRITICAL_HOLD");
                         int real_tenth_inner=0;
                         temp_tier_thresholds(enter_th_inner, exit_th_inner);
@@ -1096,6 +1118,8 @@ int main()
                                                                                    (double)real_tenth_inner/10.0, exit_th_inner[2], enter_th_inner[1], inner_current);
                                 else if(should_log() && temp_tier == 3) printf_with_time("电池温度%.1f℃处于3级限流，电流保持%dμA",
                                                                                         (double)real_tenth_inner/10.0, inner_current);
+                                else if(should_log() && temp_tier == 4) printf_with_time("电池温度%.1f℃处于4级限流（重负载兜底），电流保持%dμA",
+                                                                                        (double)real_tenth_inner/10.0, inner_current);
                             }
                         }
                         /*
@@ -1123,7 +1147,7 @@ int main()
             /*
             按电量分段限流，并用温度传感器的原始读数做独立熔断
             FORCE_TEMP把电池温度伪造成28℃之后，系统自己的过温保护等于失效，
-            所以这里必须再拿一遍thermal_zone的真实温度，按三级梯度降流
+            所以这里必须再拿一遍thermal_zone的真实温度，按四级梯度降流
             */
             applied_current=stage_current_limit(atoi(power), atoi(current_max_char), stage_name, sizeof(stage_name));
             if(read_one_option("TEMP_CTRL") == 1 && temp_sensor_num && temp_sensor != NULL)
@@ -1150,12 +1174,12 @@ int main()
                 if(real_temp > 0)
                 {
                     /*
-                    三级温度梯度（阈值与设计依据见 temp_tier_thresholds 上方注释）
+                    四级温度梯度（阈值与设计依据见 temp_tier_thresholds 上方注释）
                     限流值统一取 min(分段电流, 该级限流值)：
                     旧版是直接赋值，1级限流时会把 80-90% 段的 5.6A 抬回 6A，
                     属于往"电流变大"的方向改，与限流的本意相反
                     */
-                    int enter_th[3]={0}, exit_th[4]={0};
+                    int enter_th[4]={0}, exit_th[5]={0};
                     int crit_hold=read_one_option("CRITICAL_HOLD");
                     int was_tier=temp_tier;
                     int tenth_for_tier=have_bat_temp?real_tenth:(real_temp/100);
@@ -1189,19 +1213,22 @@ int main()
                         else if(temp_tier == 2)
                             printf_with_time("电池温度%.1f℃进入2级限流（≥%d℃），电流降为%dμA，跌破%d℃回到1级",
                                              (double)tenth_for_tier/10.0, enter_th[1], applied_current, exit_th[2]);
-                        else
+                        else if(temp_tier == 3)
                             printf_with_time("电池温度%.1f℃进入3级限流（≥%d℃），电流降为%dμA，跌破%d℃且至少保持%d秒才回到2级",
                                              (double)tenth_for_tier/10.0, enter_th[2], applied_current, exit_th[3], crit_hold);
+                        else
+                            printf_with_time("电池温度%.1f℃进入4级限流（≥%d℃，重负载兜底），电流降为%dμA，跌破%d℃且至少保持%d秒才回到3级",
+                                             (double)tenth_for_tier/10.0, enter_th[3], applied_current, exit_th[4], crit_hold);
                     }
                     else if(temp_tier > 0 && should_log())
                     {
-                        if(temp_tier == 3 && crit_hold > 0 && tenth_for_tier <= exit_th[3]*10)
+                        if(temp_tier >= 3 && crit_hold > 0 && tenth_for_tier <= exit_th[temp_tier]*10)
                         {
                             long held=(long)(time(NULL)-tier_high_since);
                             if(held < crit_hold)
-                                printf_with_time("电池温度%.1f℃已回到3级解除阈值%d℃以下，但最短保持%d秒未到（已保持%ld秒），电流暂保持%dμA",
-                                                 (double)tenth_for_tier/10.0, exit_th[3], crit_hold, held, applied_current);
-                            else printf_with_time("电池温度%.1f℃处于3级限流，电流保持%dμA", (double)tenth_for_tier/10.0, applied_current);
+                                printf_with_time("电池温度%.1f℃已回到%d级解除阈值%d℃以下，但最短保持%d秒未到（已保持%ld秒），电流暂保持%dμA",
+                                                 (double)tenth_for_tier/10.0, temp_tier, exit_th[temp_tier], crit_hold, held, applied_current);
+                            else printf_with_time("电池温度%.1f℃处于%d级限流，电流保持%dμA", (double)tenth_for_tier/10.0, temp_tier, applied_current);
                         }
                         else printf_with_time("电池温度%.1f℃处于%d级限流（%d~%d℃），电流保持%dμA",
                                               (double)tenth_for_tier/10.0, temp_tier, exit_th[temp_tier], enter_th[temp_tier-1], applied_current);

@@ -48,11 +48,11 @@ adb pull /data/adb/turbo-charge/charge_log.csv
 - `tsensor_c` 温度传感器原始读数（模块改不到的那个）。`tbat_c` 是被伪造成 28.0 的那一列，只能当参考
 - `vusb_v` / `ibus_max_a` 充电器侧电压与电流上限。多数 MTK 机型这两个节点不暴露真实 VBUS（恒为 NA 或 0.00），此时判断"67W 套件有没有被识别"只能看 `pbat_w` 能否长时间超过 25W
 - `ccc_max_a` / `ccc_a` 内核实际接受的恒流上限和实际恒流值。模块写进去又被系统改回去，这里会立刻露出来
-- `applied_a` / `stage` 模块本轮写入的电流与所处档位（`0-80`、`80-90`、`TEMP-GUARD`(7A)、`TEMP-GUARD2`(6A)、`TEMP-CRIT`(4.5A) 等）
+- `applied_a` / `stage` 模块本轮写入的电流与所处档位（`0-80`、`80-90`、`TEMP-GUARD`(7A)、`TEMP-GUARD2`(6A)、`TEMP-CRIT`(4.5A)、`TEMP-CRIT2`(2A) 等）
 
 7.智能分段充电（`SMART_CHARGE=1`）把降速点挪到高电量段。要它真正生效，**必须同时把 `STEP_CHARGING_DISABLED` 设为 1**，否则系统会在电量过半后先自己降流，模块写多大的电流上限都没用——这是“峰值只维持一小会儿然后一路掉到10W”最常见的原因。老配置文件升级后不会自动改这一项，需要手动改
 
-8.温度保护分两层。**第一层是电池侧三级梯度**（用 `thermal_zone` 里的电池传感器原始读数，模块从不写它）：`FORCE_TEMP_MAX`(52℃) 进 1 级 → 限流到 `HIGHEST_TEMP_CURRENT`(7A)，跌破 `GUARD_RECOVER`(49℃) 解除；`GUARD2_TEMP`(55℃) 进 2 级 → `GUARD2_CURRENT`(6A)，跌破 `GUARD2_RECOVER`(52℃) 回 1 级；`CRITICAL_TEMP`(57℃) 进 3 级 → `CRITICAL_CURRENT`(4.5A)，跌破 `CRITICAL_RECOVER`(54℃) 且至少保持 `CRITICAL_HOLD`(180 秒) 才回 2 级。**第二层是手机本体温度**：`TEMP_MAX`(58℃，wifi_therm) 超过就进入 `TEMP-CTRL` 内层循环，起点电流取 1 级与 2 级较小值，同样受上面那套梯度约束。为什么要分三级：`FORCE_TEMP=1` 把系统看到的温度伪造成 28℃ 之后，系统自己的 JEITA 保护等于失效，所有保护都得由模块自己完成，而一刀切的"8A/6A 二选一"会在温度只高 1℃ 时把功率砍掉 8W
+8.温度保护分两层。**第一层是电池侧四级梯度**（用 `thermal_zone` 里的电池传感器原始读数，模块从不写它）：`FORCE_TEMP_MAX`(52℃) 进 1 级 → 限流到 `HIGHEST_TEMP_CURRENT`(7A)，跌破 `GUARD_RECOVER`(49℃) 解除；`GUARD2_TEMP`(55℃) 进 2 级 → `GUARD2_CURRENT`(6A)，跌破 `GUARD2_RECOVER`(52℃) 回 1 级；`CRITICAL_TEMP`(57℃) 进 3 级 → `CRITICAL_CURRENT`(4.5A)，跌破 `CRITICAL_RECOVER`(54℃) 且至少保持 `CRITICAL_HOLD`(180 秒) 才回 2 级；`CRITICAL2_TEMP`(60℃) 进 4 级 → `CRITICAL2_CURRENT`(2A)，跌破 `CRITICAL2_RECOVER`(58℃) 同样受 `CRITICAL_HOLD` 约束才回 3 级。**第二层是手机本体温度**：`TEMP_MAX`(58℃，wifi_therm) 超过就进入 `TEMP-CTRL` 内层循环，起点电流取 1 级与 2 级较小值，同样受上面那套梯度约束。为什么要分四级：`FORCE_TEMP=1` 把系统看到的温度伪造成 28℃ 之后，系统自己的 JEITA 保护等于失效，所有保护都得由模块自己完成，而一刀切的"8A/6A 二选一"会在温度只高 1℃ 时把功率砍掉 8W
 
 ## CI构建与自动发版
 

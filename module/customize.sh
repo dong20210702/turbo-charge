@@ -253,7 +253,7 @@ on_install()
         fi
         if [[ "${_cur_cr}" == "53" ]]; then
             sed -i "s/^CRITICAL_RECOVER=.*/CRITICAL_RECOVER=54/g" ${TMPDIR}/option.txt
-            ui_print "  - CRITICAL_RECOVER已随三级梯度调整为54℃"
+            ui_print "  - CRITICAL_RECOVER已随四级梯度调整为54℃"
         fi
         # v81 新增的 2级限流项：缺项时程序会用默认值，但补写进配置文件用户才能看见
         for _k in "GUARD2_TEMP=55" "GUARD2_CURRENT=6000000" "GUARD2_RECOVER=52"; do
@@ -263,10 +263,19 @@ on_install()
                 ui_print "  - 新增配置项 ${_k}"
             fi
         done
+        # v85 新增的 4级限流项：亮屏重负载时 3级(4.5A) 是最后一级，
+        # 实测电池能在 4.5A 下维持 59℃ 半小时，模块已无档可退，补一级 2A 兜底
+        for _k in "CRITICAL2_TEMP=60" "CRITICAL2_CURRENT=2000000" "CRITICAL2_RECOVER=58"; do
+            _kname="${_k%%=*}"
+            if ! grep -q "^${_kname}=" ${TMPDIR}/option.txt; then
+                echo "${_k}" >> ${TMPDIR}/option.txt
+                ui_print "  - 新增配置项 ${_k}（4级限流：≥60℃降到2A，跌破58℃回3级）"
+            fi
+        done
         ui_print "  - 采样日志格式已变更（删除 vin_v/icl_max_a/icl_bat_a 三列），旧的 charge_log.csv 会自动改名为 charge_log.old.csv"
     else
         ui_print " 旧配置文件不存在，使用默认配置"
-        ui_print "  - 采用三级温度梯度：52℃降到7A、55℃降到6A、57℃降到4.5A，温度回落时逐级放开"
+        ui_print "  - 采用四级温度梯度：52℃降到7A、55℃降到6A、57℃降到4.5A、60℃降到2A，温度回落时逐级放开"
         ui_print "  - 不添加电量控制"
         ui_print "  - 关闭阶梯式充电（STEP_CHARGING_DISABLED=1），避免系统提前降流"
         ui_print "  - 启用强制显示28℃功能"
